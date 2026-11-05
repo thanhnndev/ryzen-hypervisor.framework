@@ -92,7 +92,7 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
 - Only the **Intel build 4.97.0** is supported; `./rhv docker-desktop get` installs it. Turn off automatic updates in Docker's settings; after an update run
   `./rhv docker-desktop` again.
 - Quit Docker Desktop before running `./rhv docker-desktop`. The step also switches Docker to its HyperKit engine (not "Virtualization framework"); that is on purpose.
-- If Docker does not start after a restart of the Mac, delete the leftover file `~/Library/Containers/com.docker.docker/Data/vms/0/hyperkit.pid` and start it again.
+- Docker Desktop kills HyperKit whenever it stops the VM (Quit, Resource Saver, `docker desktop stop`) and leaves `~/Library/Containers/com.docker.docker/Data/vms/0/hyperkit.pid` behind, which made the next start fail with "Failed to set up pidfile". Since 0.7.12 RyzenHV patches HyperKit to overwrite that file. With an older kext, delete the file and start Docker again.
 
 ### For every VM
 

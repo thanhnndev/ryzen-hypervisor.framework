@@ -74,5 +74,6 @@ extern const struct rhv_patch rhv_patch_prl_vendor[];      /* prl_vm_app and lib
 extern const unsigned rhv_patch_prl_vendor_count;
 extern const struct rhv_patch rhv_patch_hyperkit_vendor;
 extern const struct rhv_patch rhv_patch_hyperkit_gla;
+extern const struct rhv_patch rhv_patch_hyperkit_pidfile;
 
 #endif

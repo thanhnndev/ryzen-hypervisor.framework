@@ -256,9 +256,34 @@ static void test_monitor_kbd_anchored(void)
     CHECK(rhv_find_monitor_kbd(buf, sizeof(buf), &k) == RHV_PATCH_NOT_FOUND);
 }
 
+/* HyperKit's pidfile open: only the O_EXCL flag changes (0xa01 -> 0x601 = O_WRONLY|O_CREAT|O_TRUNC); the call itself is kept. */
+static void test_hyperkit_pidfile(void)
+{
+    static const uint8_t code[] = { 0x48, 0x8b, 0x3d, 0xe3, 0x17, 0x43, 0x00,  0xbe, 0x01, 0x0a, 0x00, 0x00,  0xba, 0xa4, 0x01, 0x00, 0x00,
+                                    0x31, 0xc0,  0xe8, 0x68, 0x2a, 0x00, 0x00,  0x85, 0xc0 };
+    uint8_t buf[96];
+    memset(buf, 0xcc, sizeof(buf));
+    memcpy(buf + 30, code, sizeof(code));
+    size_t off = 0;
+    CHECK(rhv_patch_locate(buf, sizeof(buf), &rhv_patch_hyperkit_pidfile, &off) == RHV_PATCH_APPLIED && off == 30);
+    CHECK(rhv_patch_apply(buf + off, &rhv_patch_hyperkit_pidfile) == 0);
+    uint32_t flags;
+    memcpy(&flags, buf + 30 + 8, 4);
+    CHECK(flags == (0x0001 | 0x0200 | 0x0400));                                    /* O_WRONLY | O_CREAT | O_TRUNC */
+    buf[30 + 9] = 0x0a;
+    CHECK(memcmp(buf + 30, code, sizeof(code)) == 0);                              /* nothing else changed */
+    buf[30 + 9] = 0x06;
+    CHECK(rhv_patch_locate(buf, sizeof(buf), &rhv_patch_hyperkit_pidfile, &off) == RHV_PATCH_ALREADY);
+    /* another open (other flags or mode) is not touched */
+    memcpy(buf + 30, code, sizeof(code));
+    buf[30 + 13] = 0xed;                                                           /* mode 0755 */
+    CHECK(rhv_patch_locate(buf, sizeof(buf), &rhv_patch_hyperkit_pidfile, &off) == RHV_PATCH_NOT_FOUND);
+}
+
 int main(void)
 {
     test_basic();
+    test_hyperkit_pidfile();
     test_ambiguous_and_edges();
     test_branches();
     test_monitor_kbd();
@@ -287,6 +312,11 @@ int main(void)
     const char *hk = "/Applications/Docker.app/Contents/Resources/bin/com.docker.hyperkit.orig";
     real(hk, &rhv_patch_hyperkit_vendor, 0x227b56);
     real(hk, &rhv_patch_hyperkit_gla, 0x20af38);
+    /* the installed HyperKit (Docker Desktop 4.98.0, build 245422): the kext patches it in memory only, the file stays as shipped */
+    const char *hki = "/Applications/Docker.app/Contents/Resources/bin/com.docker.hyperkit";
+    real(hki, &rhv_patch_hyperkit_vendor, 0);
+    real(hki, &rhv_patch_hyperkit_gla, 0);
+    real(hki, &rhv_patch_hyperkit_pidfile, 0x227b9f);
 
     printf("patch_test: PASS\n");
     return 0;

@@ -56,6 +56,19 @@ const struct rhv_patch rhv_patch_hyperkit_gla = {
     "?? ?? ?? ?? ?? ?? ??  ?? ?? ?? ??  90 e9 ?? ?? ?? ??  ?? ?? ?? ??  ?? ?? ??",
 };
 
+/*
+ * HyperKit setup_pidfile (src/hyperkit.c): open(pidfile, O_WRONLY|O_CREAT|O_EXCL, 0644), and the file is removed only by an atexit
+ * handler. Docker Desktop's backend ends HyperKit with a signal that skips atexit every time it stops the VM (Quit, Resource Saver,
+ * `docker desktop stop`) and never removes hyperkit.pid itself, so the next start failed with "Failed to set up pidfile". The flags
+ * 0xa01 become 0x601, O_WRONLY|O_CREAT|O_TRUNC: a leftover file is overwritten. Docker starts one HyperKit per VM directory.
+ *     mov rdi, [rip+pidfile] ; mov esi, 0xa01 ; mov edx, 0x1a4 ; xor eax, eax ; call open
+ */
+const struct rhv_patch rhv_patch_hyperkit_pidfile = {
+    "HyperKit pidfile",
+    "48 8b 3d ?? ?? ?? ??  be 01 0a 00 00  ba a4 01 00 00  31 c0  e8",
+    "?? ?? ?? ?? ?? ?? ??  ?? ?? 06 ?? ??  ?? ?? ?? ?? ??  ?? ??  ??",
+};
+
 const char *rhv_patch_result_name(rhv_patch_result r)
 {
     switch (r) {
