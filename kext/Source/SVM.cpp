@@ -435,6 +435,11 @@ bool activeOnAllUsable()
     return !gSuspended && gActive > 0 && (uint32_t)gActive == usableCount();
 }
 
+bool suspended()
+{
+    return gSuspended;
+}
+
 int ensureThisCpu()
 {
     int cpu = cpu_number();

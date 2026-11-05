@@ -53,6 +53,9 @@ uint32_t activeCpuCount();
  */
 bool activeOnAllUsable();
 
+/* True between the sleep notification (suspend) and the wake (resume): SVM is off on purpose and comes back by itself. */
+bool suspended();
+
 /*
  * For VmRun, on the CPU it is about to VMRUN on, with interrupts off. VMRUN's first instruction here is CLGI, which is #UD (a
  * kernel panic) when EFER.SVME is clear on this CPU; activeOnAllUsable() only counts what enableAll() did and cannot see a

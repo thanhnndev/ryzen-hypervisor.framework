@@ -18,8 +18,9 @@ extern "C" {
 #define RHV_ABI_VERSION 11
 #define RHV_SERVICE_NAME "com_overlorddev_RyzenHV"
 #define RHV_MAX_CPUS 64
-/* Largest number of vCPUs in one VM. */
-#define RHV_MAX_VCPUS_PER_VM 16
+/* Largest number of vCPUs in one VM. Was 16, which a 24-thread Ryzen (Docker gives HyperKit every core) ran past: the 17th
+ * hv_vcpu_create failed and HyperKit aborted. Only array sizes depend on it, no struct of this ABI. */
+#define RHV_MAX_VCPUS_PER_VM 64
 
 /*
  * IOUserClient selectors. Add new ones at the end.

@@ -14,6 +14,7 @@
 #include "HvPatch.hpp"
 #include "HvMsrs.hpp"
 #include "HvSlots.hpp"
+#include "VcpuName.hpp"
 #include "RyzenHV.hpp"
 #include "KernelDecls.hpp"
 #include "Vm.hpp"
@@ -422,6 +423,14 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     if (hv_get_thread_target())
         return kHvBusy;                              /* this thread owns a vCPU already */
 
+    /* HyperKit insists on getting the index its thread is named after (VcpuName.hpp); the name lies just below &id. */
+    int wantId = -1;
+    if (vm->hyperkit && a.idPtr >= rhv::hv::kVcpuNameWindow) {
+        uint8_t below[rhv::hv::kVcpuNameWindow];
+        if (copyin((user_addr_t)(a.idPtr - rhv::hv::kVcpuNameWindow), below, sizeof(below)) == 0)
+            wantId = rhv::hv::findVcpuName(below, sizeof(below), kMaxVcpus);
+    }
+
     if (!gSvc)
         return kHvNoDev;
     HvVcpu *v = (HvVcpu *)IOMallocZero(sizeof(HvVcpu));
@@ -441,8 +450,12 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     }
     IOLockLock(vm->lock);
     unsigned id = 0;
-    while (id < kMaxVcpus && vm->vcpu[id])
-        id++;
+    const bool named = wantId >= 0 && !vm->vcpu[wantId];
+    if (named)
+        id = (unsigned)wantId;
+    else
+        while (id < kMaxVcpus && vm->vcpu[id])
+            id++;
     if (id == kMaxVcpus) {
         IOLockUnlock(vm->lock);
         v->cpu->release();
@@ -463,6 +476,12 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     vm->vcpu[id] = v;
     vm->nVcpus++;
     IOLockUnlock(vm->lock);
+    if (vm->hyperkit && !named) {                    /* HyperKit will abort with "vcpu id mismatch" unless the id happens to fit */
+        static volatile SInt32 unnamedLogged;
+        if (OSIncrementAtomic(&unnamedLogged) < 20)
+            RHV_WARN("hv front end: HyperKit vCPU thread %s, gave id %u (pid %d)",
+                     wantId < 0 ? "has no \"vcpu:<n>\" name below its id" : "wants a slot that is taken", id, proc_selfpid());
+    }
 
     uint32_t outId = id;
     if (copyout(&outId, (user_addr_t)a.idPtr, sizeof(outId))) {
@@ -940,6 +959,17 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
             *gprWord(v, R_RCX) &= ~((1ull << 2) | (1ull << 22) | (1ull << 23) | (1ull << 24) | (1ull << 26) | (1ull << 27) | (1ull << 29));
         else if (v->cpuidLeaf == 0x80000008u)
             *gprWord(v, R_RBX) = 0;
+        else if (v->cpuidLeaf == 0x80000026u) {
+            /* AMD extended topology (Zen 4 and later). HyperKit (src/lib/vmm/x86.c, x86_emulate_cpuid) caps leaves at the host's
+             * 0x80000000 maximum and passes unknown ones through with cpuid_count, so EDX carried the x2APIC id of whichever host
+             * core the vCPU thread ran on. Linux reads this leaf before 0xB on AMD (arch/x86/kernel/cpu/topology_ext.c,
+             * cpu_parse_topology_ext), so the guest saw "APIC ID mismatch. CPUID: 0x0017 APIC: 0x0001" and a broken topology.
+             * All zeros is an invalid level (num_processors 0): Linux falls back to leaf 0xB, which HyperKit fills with vcpu_id. */
+            *gprWord(v, R_RAX) = 0;
+            *gprWord(v, R_RBX) = 0;
+            *gprWord(v, R_RCX) = 0;
+            *gprWord(v, R_RDX) = 0;
+        }
     }
     RHVRegs regs;
     cpu->getRegs(&regs);

@@ -866,6 +866,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
     bool rescanned  = false;          /* CPUs that came online after the kext started: look for them once per run */
     bool needRescan = false;
+    bool sleepWait  = false;          /* SVM is off for sleep: wait a little before going back to the client */
 
     for (;;) {
         if (needRescan) {             /* outside the page-table lock and with interrupts on: it runs a rendezvous and may allocate */
@@ -921,10 +922,26 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             needRescan = true;
             continue;
         }
+        if (!svm::activeOnAllUsable() && svm::suspended()) {
+            /* The Mac is going to sleep (or has not finished waking): SVM is off on purpose. An error here made HyperKit abort
+             * ("vmentry error"). Hand the client a time-slice exit instead, as for a kick; it calls run again, and after the wake
+             * resume() has SVM back on. The short sleep keeps a client that loops on run from spinning meanwhile. */
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            {
+                static volatile SInt32 sleepLogged;
+                if (OSIncrementAtomic(&sleepLogged) < 20)
+                    RHV_INFO("VmRun: SVM is off for sleep, vCPU %u waits for the wake", fIndex);
+            }
+            sleepWait = true;              /* slept after the loop, when the page-table lock is no longer held */
+            timeslice = true;
+            takePendingEvent();
+            break;
+        }
         if (!svm::activeOnAllUsable()) {
             fRunCpu = -1;
             ml_set_interrupts_enabled(ints);
-            RHV_ERR("VmRun: SVM was turned off under us (sleep?), not entering the guest");
+            RHV_ERR("VmRun: SVM was turned off under us, not entering the guest");
             rc = kIOReturnNotReady;
             break;
         }
@@ -1112,6 +1129,9 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
         break;
     }
+
+    if (sleepWait)
+        IOSleep(20);
 
     if (rc == kIOReturnSuccess) {
         bool vmxTranslated = false;
