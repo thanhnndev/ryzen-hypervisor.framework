@@ -74,8 +74,27 @@ const char *const kThreadNames[kTraps] = {
  * Logs the call, with the argument as a number and, when it looks like a user pointer that can be read, up to eight
  * words behind it. copyin() fails cleanly for a value that is not a readable address (a deadline, a mask, a slot).
  */
-void logTrap(unsigned type, unsigned index, uint64_t arg, SInt32 n)
+/*
+ * Which calls of a trap are logged, and at what level: the first 24 and #1000, #10000, #100000... at INFO, the other thousandths at
+ * TRACE. Every thousandth at INFO was ~100 lines a second with Docker running: it wrapped the 64 KiB ring in seconds (the start-up
+ * lines, the TSC check and errors were gone) and, mirrored to IOLog, put the same load on the kernel log. 0: do not log.
+ */
+uint32_t trapLogLevel(SInt32 n)
 {
+    if (n <= 24)
+        return RHV_LOG_INFO;
+    if (n % 1000)
+        return 0;
+    SInt32 d = n;
+    while (d % 10 == 0)
+        d /= 10;
+    return d == 1 ? RHV_LOG_INFO : RHV_LOG_TRACE;
+}
+
+void logTrap(unsigned type, unsigned index, uint64_t arg, SInt32 n, uint32_t lvl)
+{
+    if (lvl > rhv::log::level())
+        return;                                   /* skip the copyin as well */
     const char *name = (type == HV_TASK_TRAP ? kTaskNames : kThreadNames)[index];
     uint64_t w[8] = {0};
     unsigned words = 0;
@@ -86,16 +105,16 @@ void logTrap(unsigned type, unsigned index, uint64_t arg, SInt32 n)
                 words = sizes[i] / 8;
     }
     if (words >= 5)
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx %#llx %#llx %#llx%s]", type == HV_TASK_TRAP ? "task" : "thread", index,
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx %#llx %#llx %#llx%s]", type == HV_TASK_TRAP ? "task" : "thread", index,
                  name, (int)n, proc_selfpid(), arg, w[0], w[1], w[2], w[3], w[4], words > 5 ? " ..." : "");
     else if (words >= 2)
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
                  proc_selfpid(), arg, w[0], w[1]);
     else if (words == 1)
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx [%#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx [%#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
                  proc_selfpid(), arg, w[0]);
     else
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n, proc_selfpid(),
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n, proc_selfpid(),
                  arg);
 }
 
@@ -355,8 +374,8 @@ volatile SInt32 gTraceCount[2][16];
 void note(unsigned type, unsigned index, uint64_t arg)
 {
     SInt32 n = OSIncrementAtomic((volatile SInt32 *)&gTraceCount[type][index]) + 1;
-    if (n <= 24 || (n % 1000) == 0)
-        logTrap(type, index, arg, n);
+    if (uint32_t lvl = trapLogLevel(n))
+        logTrap(type, index, arg, n, lvl);
 }
 
 kern_return_t hvFromIo(IOReturn r);
@@ -1378,8 +1397,8 @@ kern_return_t stub(void *target, uint64_t arg)
 {
     (void)target;
     SInt32 n = OSIncrementAtomic((volatile SInt32 *)&gCount[Type][Index]) + 1;
-    if (n <= 24 || (n % 1000) == 0)
-        logTrap(Type, Index, arg, n);
+    if (uint32_t lvl = trapLogLevel(n))
+        logTrap(Type, Index, arg, n, lvl);
     return gMode >= 2 ? KERN_SUCCESS : kHvUnsupported;
 }
 
