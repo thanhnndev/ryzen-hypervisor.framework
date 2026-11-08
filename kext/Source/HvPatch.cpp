@@ -45,6 +45,14 @@ const Patch kPatches[] = {
     {"HyperKit pidfile", "com.docker.hyper",
      "48 8b 3d ?? ?? ?? ??  be 01 0a 00 00  ba a4 01 00 00  31 c0  e8",
      "?? ?? ?? ?? ?? ?? ??  ?? ?? 06 ?? ??  ?? ?? ?? ?? ??  ?? ??  ??"},
+    /* virtio-sock: the error paths of connect_sock and handle_connect_fd took the list write lock while holding the socket's mutex, against the rx
+     * thread's order (deadlock: every vsock connection of the VM stops). They now hand the socket to the rx thread's close (CLOSING_RX). */
+    {"HyperKit vsock connect error", "com.docker.hyper",
+     "44 89 ff e8 ?? ?? ?? ??  48 8b 5d ??  48 89 df  e8 ?? ?? ?? ??  4c 89 f7  4c 89 ee  e8 c9 11 00 00  48 89 df  e8 ?? ?? ?? ??",
+     "?? ?? ?? ?? ?? ?? ?? ??  48 b8 04 00 00 00 ff ff ff ff  49 89 45 70  41 c7 45 7c 03 00 00 00  4c 89 ef  e8 94 11 00 00  90"},
+    {"HyperKit vsock accept error", "com.docker.hyper",
+     "49 8d 9e 48 01 00 00  48 89 df  e8 ?? ?? ?? ??  4c 89 f7  4c 89 fe  e8 6e f9 ff ff  48 89 df  e8 ?? ?? ?? ??",
+     "48 b8 04 00 00 00 ff ff ff ff  49 89 47 70  41 c7 47 7c 03 00 00 00  4c 89 ff  e8 3c f9 ff ff  0f 1f 40 00"},
 };
 constexpr unsigned kNumPatches = sizeof(kPatches) / sizeof(kPatches[0]);
 

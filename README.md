@@ -93,6 +93,10 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
   `./rhv docker-desktop` again.
 - Quit Docker Desktop before running `./rhv docker-desktop`. The step also switches Docker to its HyperKit engine (not "Virtualization framework"); that is on purpose.
 - Docker Desktop kills HyperKit whenever it stops the VM (Quit, Resource Saver, `docker desktop stop`) and leaves `~/Library/Containers/com.docker.docker/Data/vms/0/hyperkit.pid` behind, which made the next start fail with "Failed to set up pidfile". Since 0.7.12 RyzenHV patches HyperKit to overwrite that file. With an older kext, delete the file and start Docker again.
+- Containers that stay in "Created", `docker inspect` that hangs while `docker ps` still answers: HyperKit's virtio-sock had stopped. Its error path for a
+  connection that fails (the other side closed at once, or nobody listens on the port) took two locks in the wrong order, and the rx and tx threads waited for each
+  other, so every vsock connection of the VM stopped (logs, file sharing, container start). Since 0.7.13 RyzenHV patches both error paths of HyperKit to close the
+  socket the way the rest of HyperKit does. With an older kext, quit and start Docker Desktop again.
 
 ### For every VM
 

@@ -280,10 +280,74 @@ static void test_hyperkit_pidfile(void)
     CHECK(rhv_patch_locate(buf, sizeof(buf), &rhv_patch_hyperkit_pidfile, &off) == RHV_PATCH_NOT_FOUND);
 }
 
+/* rel32 call at buf+at: its target, as an offset in buf */
+static long call_target(const uint8_t *buf, size_t at)
+{
+    int32_t rel;
+    memcpy(&rel, buf + at + 1, 4);
+    return (long)at + 5 + rel;
+}
+
+/* HyperKit's two virtio-sock error paths (Docker Desktop 4.97.0 bytes): after the patch the socket is handed to the rx thread (fd -1, state CLOSING_RX,
+ * local_shutdown ALL) and only unlocked, no list write lock; the new call goes to put_sock, 0x2e bytes before free_sock. */
+static void check_vsock(const struct rhv_patch *p, const uint8_t *code, size_t n, size_t freeCall, size_t putCall, size_t keep, uint8_t sReg)
+{
+    uint8_t buf[256];
+    memset(buf, 0xcc, sizeof(buf));
+    memcpy(buf + 40, code, n);
+    size_t off = 0;
+    CHECK(rhv_patch_locate(buf, sizeof(buf), p, &off) == RHV_PATCH_APPLIED && off == 40);
+    const long freeAt = call_target(buf, off + freeCall);
+    CHECK(rhv_patch_apply(buf + off, p) == 0);
+    CHECK(memcmp(buf + off, code, keep) == 0);                                     /* close(fd) of the connect path is kept */
+    static const uint8_t st[] = { 0x48, 0xb8, 0x04, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };    /* state 4 = SOCK_CLOSING_RX, fd -1 */
+    CHECK(memcmp(buf + off + keep, st, sizeof(st)) == 0);
+    const uint8_t *m = buf + off + keep + 10;
+    CHECK(m[0] == 0x49 && m[1] == 0x89 && m[2] == (0x40 | sReg) && m[3] == 0x70);            /* mov [s+0x70], rax */
+    CHECK(m[4] == 0x41 && m[5] == 0xc7 && m[6] == (0x40 | sReg) && m[7] == 0x7c && m[8] == 3);  /* local_shutdown = SHUTDOWN_ALL */
+    CHECK(m[12] == 0x4c && m[13] == 0x89 && m[14] == (0xc7 | sReg << 3));                        /* mov rdi, s */
+    CHECK(buf[off + putCall] == 0xe8 && call_target(buf, off + putCall) == freeAt - 0x2e);  /* put_sock */
+    CHECK(rhv_patch_locate(buf, sizeof(buf), p, &off) == RHV_PATCH_ALREADY);
+    /* another distance to free_sock (another build): left alone */
+    memcpy(buf + 40, code, n);
+    buf[40 + freeCall + 1] ^= 0x10;
+    CHECK(rhv_patch_locate(buf, sizeof(buf), p, &off) == RHV_PATCH_NOT_FOUND);
+}
+
+static void test_hyperkit_vsock(void)
+{
+    static const uint8_t conn[] = { 0x44, 0x89, 0xff, 0xe8, 0x3c, 0xc1, 0x00, 0x00,  0x48, 0x8b, 0x5d, 0xc8,  0x48, 0x89, 0xdf,  0xe8, 0x9e, 0xc5, 0x00, 0x00,
+                                    0x4c, 0x89, 0xf7,  0x4c, 0x89, 0xee,  0xe8, 0xc9, 0x11, 0x00, 0x00,  0x48, 0x89, 0xdf,  0xe8, 0x85, 0xc5, 0x00, 0x00 };
+    static const uint8_t acc[] = { 0x49, 0x8d, 0x9e, 0x48, 0x01, 0x00, 0x00,  0x48, 0x89, 0xdf,  0xe8, 0x43, 0xad, 0x00, 0x00,  0x4c, 0x89, 0xf7,
+                                   0x4c, 0x89, 0xfe,  0xe8, 0x6e, 0xf9, 0xff, 0xff,  0x48, 0x89, 0xdf,  0xe8, 0x2a, 0xad, 0x00, 0x00 };
+    check_vsock(&rhv_patch_hyperkit_vsock_connect, conn, sizeof(conn), 26, 33, 8, 5);   /* s in r13 */
+    check_vsock(&rhv_patch_hyperkit_vsock_accept, acc, sizeof(acc), 21, 25, 0, 7);      /* s in r15 */
+}
+
+/* In the installed HyperKit: the patched call lands on put_sock (push rbp ; mov rbp, rsp ; call pthread_mutex_unlock ; test eax, eax ; jne ; pop ; ret). */
+static void real_vsock(const char *path, const struct rhv_patch *p, size_t putCall)
+{
+    size_t len, off = 0;
+    unsigned char *b = slurp(path, &len);
+    if (!b)
+        return;
+    CHECK(rhv_patch_locate(b, len, p, &off) == RHV_PATCH_APPLIED);
+    uint8_t pat[64];
+    memcpy(pat, b + off, sizeof(pat));
+    CHECK(rhv_patch_apply(pat, p) == 0);
+    const long put = (long)off + call_target(pat, putCall);
+    static const uint8_t pro[] = { 0x55, 0x48, 0x89, 0xe5, 0xe8 };
+    static const uint8_t tail[] = { 0x85, 0xc0, 0x75, 0x02, 0x5d, 0xc3 };
+    CHECK(put > 0 && (size_t)put + 15 < len && memcmp(b + put, pro, 5) == 0 && memcmp(b + put + 9, tail, 6) == 0);
+    printf("  %s: put_sock at %#lx\n", p->name, put);
+    free(b);
+}
+
 int main(void)
 {
     test_basic();
     test_hyperkit_pidfile();
+    test_hyperkit_vsock();
     test_ambiguous_and_edges();
     test_branches();
     test_monitor_kbd();
@@ -317,6 +381,10 @@ int main(void)
     real(hki, &rhv_patch_hyperkit_vendor, 0);
     real(hki, &rhv_patch_hyperkit_gla, 0);
     real(hki, &rhv_patch_hyperkit_pidfile, 0x227b9f);
+    real(hki, &rhv_patch_hyperkit_vsock_connect, 0x21e13e);
+    real(hki, &rhv_patch_hyperkit_vsock_accept, 0x21f996);
+    real_vsock(hki, &rhv_patch_hyperkit_vsock_connect, 33);
+    real_vsock(hki, &rhv_patch_hyperkit_vsock_accept, 25);
 
     printf("patch_test: PASS\n");
     return 0;

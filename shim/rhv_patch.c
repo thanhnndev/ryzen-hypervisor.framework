@@ -69,6 +69,35 @@ const struct rhv_patch rhv_patch_hyperkit_pidfile = {
     "?? ?? ?? ?? ?? ?? ??  ?? ?? 06 ?? ??  ?? ?? ?? ?? ??  ?? ??  ??",
 };
 
+/*
+ * HyperKit virtio-sock (src/lib/pci_virtio_sock.c): the lock order is list_rwlock, then the socket's mutex (lookup_sock, and the rx thread, which
+ * holds the read lock while it locks every socket in use). alloc_sock returns a socket locked. When connect_sock (guest connects to a host socket)
+ * or handle_connect_fd (host connects to the guest) then fails, the error path takes the write lock while still holding that socket's mutex. If the
+ * rx thread is in its loop at that moment, it waits for the socket and the tx thread waits for the write lock: both stop, and with them every vsock
+ * connection of the VM (Docker's VM logs, file sharing, container start; seen as containers left in "Created"). The usual failure is
+ * set_socket_options: XNU refuses setsockopt with EINVAL once the peer has closed (sosetoptlock, both SS_CANTRCVMORE and SS_CANTSENDMORE set);
+ * connect() to a port nobody listens on takes the same path.
+ *
+ * The error paths are replaced by the close the file itself describes for the tx loop ("go straight to CLOSING_RX"): fd = -1, state =
+ * SOCK_CLOSING_RX, local_shutdown = SHUTDOWN_ALL, unlock the socket. The rx thread then frees it under the write lock, in the right order. The rest
+ * stays: the fd is closed and the guest gets its RST as before. struct pci_vtsock_sock in this build: state 0x70, fd 0x74, local_shutdown 0x7c.
+ *     movabs rax, 0xffffffff00000004 ; mov [s+0x70], rax ; mov dword [s+0x7c], 3 ; mov rdi, s ; call put_sock
+ * put_sock lies 0x2e bytes before free_sock; the call to free_sock is part of the pattern, so the distance is fixed by it.
+ */
+const struct rhv_patch rhv_patch_hyperkit_vsock_connect = {
+    "HyperKit vsock connect error",
+    /* close(fd) ; rbx = &list_rwlock ; wrlock ; free_sock(sc = r14, s = r13) ; unlock */
+    "44 89 ff e8 ?? ?? ?? ??  48 8b 5d ??  48 89 df  e8 ?? ?? ?? ??  4c 89 f7  4c 89 ee  e8 c9 11 00 00  48 89 df  e8 ?? ?? ?? ??",
+    "?? ?? ?? ?? ?? ?? ?? ??  48 b8 04 00 00 00 ff ff ff ff  49 89 45 70  41 c7 45 7c 03 00 00 00  4c 89 ef  e8 94 11 00 00  90",
+};
+
+const struct rhv_patch rhv_patch_hyperkit_vsock_accept = {
+    "HyperKit vsock accept error",
+    /* rbx = &sc->list_rwlock ; wrlock ; free_sock(sc = r14, s = r15) ; unlock ; (then close(fd), kept) */
+    "49 8d 9e 48 01 00 00  48 89 df  e8 ?? ?? ?? ??  4c 89 f7  4c 89 fe  e8 6e f9 ff ff  48 89 df  e8 ?? ?? ?? ??",
+    "48 b8 04 00 00 00 ff ff ff ff  49 89 47 70  41 c7 47 7c 03 00 00 00  4c 89 ff  e8 3c f9 ff ff  0f 1f 40 00",
+};
+
 const char *rhv_patch_result_name(rhv_patch_result r)
 {
     switch (r) {

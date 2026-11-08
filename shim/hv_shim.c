@@ -135,8 +135,10 @@ __attribute__((constructor)) static void rhv_shim_init(void)
         rhv_core_offer_nmi_window = 1;
         rhv_core_vcpu_hint = hyperkit_vcpu_hint;
         g_hyperkit = 1;
-        /* The two checks HyperKit makes that an AMD CPU cannot pass, and its pidfile open, found by their bytes (shim/rhv_patch.c). */
-        const struct rhv_patch *hk[] = { &rhv_patch_hyperkit_vendor, &rhv_patch_hyperkit_gla, &rhv_patch_hyperkit_pidfile };
+        /* The two checks HyperKit makes that an AMD CPU cannot pass, its pidfile open and the two virtio-sock error paths, found by their bytes
+         * (shim/rhv_patch.c). */
+        const struct rhv_patch *hk[] = { &rhv_patch_hyperkit_vendor, &rhv_patch_hyperkit_gla, &rhv_patch_hyperkit_pidfile,
+                                         &rhv_patch_hyperkit_vsock_connect, &rhv_patch_hyperkit_vsock_accept };
         for (size_t i = 0; i < sizeof(hk) / sizeof(hk[0]); i++) {
             rhv_patch_result r = rhv_patch_image(_dyld_get_image_header(0), hk[i]);
             rhv_trace("%s: %s", hk[i]->name, rhv_patch_result_name(r));
