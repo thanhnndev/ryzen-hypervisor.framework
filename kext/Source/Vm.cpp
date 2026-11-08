@@ -202,6 +202,8 @@ void com_overlorddev_RyzenHVVmShared::free()
         IOLockFree(fRegLock);
         fRegLock = nullptr;
     }
+    /* A guest's TSC writes must not have reached the host: look once the VM is gone (on a kernel thread, it runs a rendezvous). */
+    rhv::svm::scheduleTscCheck("a VM was destroyed");
     OSObject::free();
 }
 
@@ -1072,6 +1074,35 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 v->control.eventInjErr = v->control.exitIntInfoErr;
             }
             /* The host needed the CPU. It has it now; run on unless the slice is over. */
+            if (mach_absolute_time() >= deadline && !injectionWaiting()) {
+                timeslice = true;
+                takePendingEvent();
+                break;
+            }
+            continue;
+        }
+
+        /*
+         * WRMSR to the TSC while the client made the TSC native: the write is intercepted on purpose (MsrMap.hpp setNative), a guest
+         * write passed through would set the host core's own TSC. Apply it to the VMCB offset, as the framework would, and run on.
+         */
+        if (fVmx && code == EXIT_MSR && v->control.exitInfo1 == 1 && (uint32_t)fGprs.rcx == rhv::msr::MSR_TSC &&
+            rhv::msr::isNative((const uint8_t *)fMsrpm.va, rhv::msr::MSR_TSC)) {
+            const uint64_t value = ((fGprs.rdx & 0xFFFFFFFFull) << 32) | (v->save.rax & 0xFFFFFFFFull);
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            fVmcs.writeMsr(rhv::msr::MSR_TSC, ((uint64_t)hi << 32) | lo, value);
+            v->save.rip = v->control.nextRip ? v->control.nextRip : v->save.rip + 2;   /* WRMSR is 0F 30 */
+            {
+                static volatile SInt32 tscWrites;
+                if (OSIncrementAtomic(&tscWrites) < 5)       /* logging is fine here: interrupts are back on */
+                    RHV_INFO("vCPU %u: guest wrote the TSC (0x%llx), applied to the TSC offset, the host TSC is untouched", fIndex,
+                             (unsigned long long)value);
+            }
+            if (v->control.exitIntInfo & (1u << 31)) {
+                v->control.eventInj    = v->control.exitIntInfo;
+                v->control.eventInjErr = v->control.exitIntInfoErr;
+            }
             if (mach_absolute_time() >= deadline && !injectionWaiting()) {
                 timeslice = true;
                 takePendingEvent();

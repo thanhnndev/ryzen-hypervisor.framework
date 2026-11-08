@@ -1,6 +1,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSAtomic.h>
+#include <kern/thread_call.h>
+#include <libkern/libkern.h>
 
 #include "KernelDecls.hpp"
 #include "Log.hpp"
@@ -248,6 +250,62 @@ uint32_t usableCount()
     return n;
 }
 
+
+/*
+ * TSC check. Every CPU, inside one rendezvous with interrupts off, takes a global spin lock kTscRounds times; under the lock it
+ * reads the TSC and compares it with the value the previous holder read. The lock orders the reads in time, so on cores whose
+ * TSCs agree the value can never go down. When it does, the previous holder's TSC is ahead of this one's by at least that much:
+ * mach_absolute_time differs between those cores and kernel code that compares timestamps taken on two cores (fq_codel's
+ * "now >= *pkt_enq_time") can panic. The same method as Linux's check_tsc_warp.
+ */
+constexpr unsigned kTscRounds = 300;
+volatile uint32_t  gTscLock;
+uint64_t           gTscLast;
+int32_t            gTscLastCpu;
+uint64_t           gTscWarps;
+uint32_t           gTscWarp[RHV_MAX_CPUS][RHV_MAX_CPUS];   /* worst backwards step, prev holder -> this CPU, in TSC cycles */
+uint8_t            gTscRan[RHV_MAX_CPUS];
+IOLock            *gTscRunLock;
+thread_call_t      gTscCall;
+
+inline uint64_t rdtscOrdered()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+
+void tscAction(void *)
+{
+    int cpu = cpu_number();
+    if (cpu < 0 || cpu >= RHV_MAX_CPUS)
+        return;
+    gTscRan[cpu] = 1;
+    for (unsigned i = 0; i < kTscRounds; i++) {
+        while (__sync_lock_test_and_set(&gTscLock, 1))
+            __asm__ volatile("pause");
+        uint64_t prev = gTscLast;
+        int32_t  pc   = gTscLastCpu;
+        uint64_t now  = rdtscOrdered();
+        if (prev && now < prev) {
+            gTscWarps++;
+            uint64_t d = prev - now;
+            uint32_t d32 = d > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)d;
+            if (pc >= 0 && pc < RHV_MAX_CPUS && d32 > gTscWarp[pc][cpu])
+                gTscWarp[pc][cpu] = d32;
+        }
+        gTscLast    = now;
+        gTscLastCpu = cpu;
+        __sync_lock_release(&gTscLock);
+        for (volatile int k = 0; k < 20; k++)
+            __asm__ volatile("pause");
+    }
+}
+
+void tscCallFn(thread_call_param_t why, thread_call_param_t)
+{
+    rhv::svm::checkTsc((const char *)why, nullptr);
+}
 } // namespace
 
 namespace rhv {
@@ -257,6 +315,10 @@ void probe(RHVInfo *out, bool readMsrs)
 {
     if (!gRescanLock)
         gRescanLock = IOLockAlloc();
+    if (!gTscRunLock)
+        gTscRunLock = IOLockAlloc();
+    if (!gTscCall)
+        gTscCall = thread_call_allocate(tscCallFn, nullptr);
     bzero(gProbe, sizeof(gProbe));
     bzero(gSeenCpu, sizeof(gSeenCpu));
     gReadMsrs = readMsrs;
@@ -355,6 +417,11 @@ void disableAll()
     gWantEnabled = false;
     gSuspended   = false;
     freeHostSave();
+    if (gTscCall) {
+        thread_call_cancel_wait(gTscCall);
+        thread_call_free(gTscCall);
+        gTscCall = nullptr;
+    }
 }
 
 void suspend()
@@ -423,6 +490,98 @@ bool verifyAll(uint32_t *ok, uint32_t *total)
     RHV_STAT_ADD(selftestCpusOk, *ok);
     RHV_INFO("selftest: %u of %u CPUs ok", *ok, *total);
     return true;
+}
+
+bool checkTsc(const char *why, uint64_t *worstOut)
+{
+    if (!gTscRunLock)
+        return false;
+    IOLockLock(gTscRunLock);
+
+    gTscLock    = 0;
+    gTscLast    = 0;
+    gTscLastCpu = -1;
+    gTscWarps   = 0;
+    bzero(gTscWarp, sizeof(gTscWarp));
+    bzero(gTscRan, sizeof(gTscRan));
+
+    uint64_t abs0 = mach_absolute_time(), tsc0 = rdtscOrdered();
+    mp_rendezvous_no_intrs(tscAction, nullptr);
+    uint64_t abs1 = mach_absolute_time(), tsc1 = rdtscOrdered();
+
+    uint32_t n = 0, worst = 0;
+    int wFrom = -1, wTo = -1;
+    for (uint32_t i = 0; i < RHV_MAX_CPUS; i++) {
+        n += gTscRan[i];
+        for (uint32_t j = 0; j < RHV_MAX_CPUS; j++)
+            if (gTscWarp[i][j] > worst) {
+                worst = gTscWarp[i][j];
+                wFrom = (int)i;
+                wTo   = (int)j;
+            }
+    }
+    /* mach_absolute_time is in ns on x86: TSC cycles per microsecond, for the log. */
+    uint64_t dAbs = abs1 > abs0 ? abs1 - abs0 : 1;
+    uint64_t mhz  = (tsc1 - tsc0) * 1000 / dAbs;
+    uint64_t worstNs = mhz ? (uint64_t)worst * 1000 / mhz : 0;
+
+    if (!gTscWarps) {
+        RHV_INFO("tsc check (%s): %u CPUs, %u rounds each, the TSC never went backwards between cores (%llu us)", why, n, kTscRounds,
+                 (unsigned long long)(dAbs / 1000));
+    } else {
+        RHV_ERR("tsc check (%s): the TSC went backwards %llu times between cores, worst %u cycles (~%llu ns), cpu %d ahead of cpu %d",
+                why, (unsigned long long)gTscWarps, worst, (unsigned long long)worstNs, wFrom, wTo);
+        RHV_ERR("tsc check: mach_absolute_time differs between cores; something wrote the TSC of single cores "
+                "(a TSC-sync kext such as ForgedInvariant, or firmware)");
+        /* Lower bound of how far each CPU is ahead of the slowest one: longest path over the measured steps. */
+        static uint32_t lead[RHV_MAX_CPUS];
+        bzero(lead, sizeof(lead));
+        for (uint32_t pass = 0; pass < n + 1; pass++) {
+            bool changed = false;
+            for (uint32_t a = 0; a < RHV_MAX_CPUS; a++)
+                for (uint32_t b = 0; b < RHV_MAX_CPUS; b++) {
+                    uint32_t d = gTscWarp[a][b];
+                    if (d && lead[b] + (uint64_t)d > lead[a] && lead[b] + (uint64_t)d < 0xFFFFFFFFull) {
+                        lead[a] = lead[b] + d;
+                        changed = true;
+                    }
+                }
+            if (!changed)
+                break;
+        }
+        uint32_t mn = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < RHV_MAX_CPUS; i++)
+            if (gTscRan[i] && lead[i] < mn)
+                mn = lead[i];
+        char line[160];
+        unsigned len = 0;
+        line[0] = 0;
+        for (uint32_t i = 0; i < RHV_MAX_CPUS; i++) {
+            if (!gTscRan[i] || lead[i] == mn)
+                continue;
+            int w = snprintf(line + len, sizeof(line) - len, " cpu%u:+%u", i, lead[i] - mn);
+            if (w < 0 || len + (unsigned)w >= sizeof(line) - 16) {
+                RHV_ERR("tsc check: ahead (cycles):%s", line);
+                len = 0;
+                line[0] = 0;
+                w = snprintf(line, sizeof(line), " cpu%u:+%u", i, lead[i] - mn);
+            }
+            if (w > 0)
+                len += (unsigned)w;
+        }
+        if (len)
+            RHV_ERR("tsc check: ahead (cycles):%s", line);
+    }
+    IOLockUnlock(gTscRunLock);
+    if (worstOut)
+        *worstOut = worst;
+    return gTscWarps == 0;
+}
+
+void scheduleTscCheck(const char *why)
+{
+    if (gTscCall)
+        thread_call_enter1(gTscCall, (thread_call_param_t)why);
 }
 
 uint32_t activeCpuCount()
@@ -515,6 +674,7 @@ uint32_t rescan()
             mp_rendezvous_no_intrs(enableAction, nullptr);
             enabled = (uint32_t)((int)gActive - before);
             RHV_INFO("rescan: SVM now on %d of %u CPUs", (int)gActive, usableCount());
+            scheduleTscCheck("cpus came online");
         }
     }
 

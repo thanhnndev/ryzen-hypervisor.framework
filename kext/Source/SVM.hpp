@@ -46,6 +46,17 @@ bool verifyAll(uint32_t *ok, uint32_t *total);
 uint32_t activeCpuCount();
 
 /*
+ * Checks that the TSC is the same on every core: every CPU reads it in turn, ordered by a spin lock, inside one rendezvous
+ * (interrupts off on every CPU for about a millisecond). Logs the result, and on a failure the worst backwards step, the
+ * CPU pair and how far each CPU is ahead. Returns true when the TSC never went backwards; *worstCycles gets the worst
+ * step. Thread context only, no lock held (it runs a rendezvous).
+ */
+bool checkTsc(const char *why, uint64_t *worstCycles);
+
+/* checkTsc() on a kernel thread, from any context where a thread call may be entered (VM teardown). `why` must be a literal. */
+void scheduleTscCheck(const char *why);
+
+/*
  * True while SVM is on in every CPU that supports it (not suspended, not
  * disabled). Cheap and lock-free: VmRun calls it with interrupts disabled,
  * right before VMRUN. Interrupts being off is what makes it race-free: the

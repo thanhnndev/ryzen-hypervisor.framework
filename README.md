@@ -97,6 +97,12 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
   connection that fails (the other side closed at once, or nobody listens on the port) took two locks in the wrong order, and the rx and tx threads waited for each
   other, so every vsock connection of the VM stopped (logs, file sharing, container start). Since 0.7.13 RyzenHV patches both error paths of HyperKit to close the
   socket the way the rest of HyperKit does. With an older kext, quit and start Docker Desktop again.
+- Panics with `assertion failed: now >= *pkt_enq_time` (classq_fq_codel.c), usually under heavy network traffic, mean the TSC is not the
+  same on every core, so `mach_absolute_time` goes backwards between cores. Check with `build/rhv-tsc-check` (no kext, no root) or
+  `rhv-info selftest` then `rhv-info log | grep "tsc check"`. A TSC-sync kext that writes the TSC on each core (ForgedInvariant 1.5.0 on
+  AMD writes MSR 0x10 on every thread after a barrier) leaves the cores a few hundred cycles apart; Zen firmware already syncs the TSC,
+  so turn it off (`-FIOff`). Before 0.7.14 a guest whose TSC the client made native (HyperKit does) could also write the host core's TSC:
+  the TSC is now native for reads only and a guest write goes to the VM's TSC offset.
 
 ### For every VM
 

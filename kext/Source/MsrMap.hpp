@@ -105,11 +105,30 @@ static inline bool setNative(uint8_t *msrpm, uint32_t msr, bool enable)
     if (!msrpmBit(msr, &off, &bit) || off >= kMsrpmSize)
         return false;
     uint8_t mask = (uint8_t)(3u << bit);            // read bit and write bit: always an even bit, so both in one byte
-    if (enable)
+    if (enable) {
         msrpm[off] &= (uint8_t)~mask;
-    else
+        /*
+         * The TSC is native for reads only. A WRMSR the MSRPM lets through writes the PHYSICAL TSC of the core the vCPU
+         * runs on (the VMCB offset is applied to reads, not to writes): the host's clock on that core jumps and
+         * mach_absolute_time stops being the same on every core. The write still exits, and Vm::run applies it to the
+         * VMCB TSC offset without a trip to the client, which is what "native" promises.
+         */
+        if (msr == MSR_TSC)
+            msrpm[off] |= (uint8_t)(2u << bit);
+    } else {
         msrpm[off] |= mask;
+    }
     return true;
+}
+
+/* Does the guest write `msr` without an exit? Never true for the TSC (see setNative). */
+static inline bool writesNative(const uint8_t *msrpm, uint32_t msr)
+{
+    uint32_t off;
+    unsigned bit;
+    if (!msrpmBit(msr, &off, &bit) || off >= kMsrpmSize)
+        return false;
+    return ((msrpm[off] >> (bit + 1)) & 1) == 0;
 }
 
 static inline bool isNative(const uint8_t *msrpm, uint32_t msr)
@@ -118,6 +137,8 @@ static inline bool isNative(const uint8_t *msrpm, uint32_t msr)
     unsigned bit;
     if (!msrpmBit(msr, &off, &bit) || off >= kMsrpmSize)
         return false;
+    if (msr == MSR_TSC)
+        return ((msrpm[off] >> bit) & 1) == 0;      // native reads; writes always exit
     return ((msrpm[off] >> bit) & 3) == 0;
 }
 

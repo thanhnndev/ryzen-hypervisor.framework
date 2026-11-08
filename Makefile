@@ -52,6 +52,7 @@ tools: | $(BUILD)
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-long-test tools/rhv-long-test/main.c \
 		-framework IOKit -framework CoreFoundation
+	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-tsc-check tools/rhv-tsc-check/main.c
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-smoke tools/hvf-smoke/main.c \
 		-framework Hypervisor
 

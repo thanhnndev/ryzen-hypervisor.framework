@@ -9,7 +9,7 @@
 
 #define super IOService
 
-#define RHV_VERSION "0.7.13"
+#define RHV_VERSION "0.7.14"
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHV, IOService)
 
@@ -136,6 +136,7 @@ bool com_overlorddev_RyzenHV::start(IOService *provider)
             if (n && fSelfTest) {
                 uint32_t ok, total;
                 rhv::svm::verifyAll(&ok, &total);
+                rhv::svm::checkTsc("start", nullptr);
             }
         } else {
             RHV_INFO("probe only; add boot-arg rhv_enable_svm=1 to enable SVM");
@@ -173,6 +174,7 @@ IOReturn com_overlorddev_RyzenHV::sleepWakeHandler(void *target, void *, UInt32 
             uint32_t ok, total;
             rhv::svm::verifyAll(&ok, &total);
         }
+        rhv::svm::scheduleTscCheck("wake");     /* a TSC-sync kext rewrites the TSC on wake: look at what it left */
         break;
     default:
         break;
@@ -199,5 +201,7 @@ void com_overlorddev_RyzenHV::getStats(RHVStats *out)
 
 bool com_overlorddev_RyzenHV::runSelfTest(uint32_t *ok, uint32_t *total)
 {
-    return rhv::svm::verifyAll(ok, total);
+    bool r = rhv::svm::verifyAll(ok, total);
+    rhv::svm::checkTsc("selftest", nullptr);    /* the result is in `rhv-info log` */
+    return r;
 }
