@@ -103,6 +103,9 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
   AMD writes MSR 0x10 on every thread after a barrier) leaves the cores a few hundred cycles apart; Zen firmware already syncs the TSC,
   so turn it off (`-FIOff`). Before 0.7.14 a guest whose TSC the client made native (HyperKit does) could also write the host core's TSC:
   the TSC is now native for reads only and a guest write goes to the VM's TSC offset.
+- Docker Desktop using a core or more while idle, `com.docker.backend.log` full of `wrmsr to register 0xc0000502(0x1)`: on Zen 5 the host
+  CPUID 0x80000021 EAX bit 22 (workload classification) reached the guest, and Linux writes MSR 0xC0000502 on every context switch,
+  which HyperKit does not know and logs. Since 0.7.17 RyzenHV clears the bit in HyperKit's CPUID answers (restart Docker Desktop).
 
 ### For every VM
 

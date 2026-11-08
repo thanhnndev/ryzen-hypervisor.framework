@@ -978,6 +978,11 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
             *gprWord(v, R_RCX) &= ~((1ull << 2) | (1ull << 22) | (1ull << 23) | (1ull << 24) | (1ull << 26) | (1ull << 27) | (1ull << 29));
         else if (v->cpuidLeaf == 0x80000008u)
             *gprWord(v, R_RBX) = 0;
+        else if (v->cpuidLeaf == 0x80000021u)
+            /* EAX bit 22, workload classification (Zen 5): Linux then writes MSR_AMD_WORKLOAD_HRST (0xC0000502) on context switches.
+             * HyperKit does not know the MSR: every write went out to userland and printed "wrmsr to register 0xc0000502(0x1)",
+             * ~4000 lines a second, and com.docker.backend burnt a core parsing them. */
+            *gprWord(v, R_RAX) &= ~(1ull << 22);
         else if (v->cpuidLeaf == 0x80000026u) {
             /* AMD extended topology (Zen 4 and later). HyperKit (src/lib/vmm/x86.c, x86_emulate_cpuid) caps leaves at the host's
              * 0x80000000 maximum and passes unknown ones through with cpuid_count, so EDX carried the x2APIC id of whichever host
