@@ -101,6 +101,9 @@ static const uint8_t kProg2[] = { 0xB8, 0xFF, 0xFF, 0x8E, 0xD8, 0xC6, 0x06, 0x20
 /* 0x1300: a tight loop, to be interrupted from another thread. */
 static const uint8_t kProg3[] = { 0xEB, 0xFE };
 
+/* 0x1400: RDTSC, WRMSR(TSC) with the value just read (harmless even if the write reached the host), RDTSC again, HLT. */
+static const uint8_t kProg4[] = { 0x0F, 0x31, 0x66, 0x89, 0xC3, 0x66, 0x89, 0xD5, 0x66, 0xB9, 0x10, 0x00, 0x00, 0x00, 0x0F, 0x30, 0x0F, 0x31, 0xF4 };
+
 /* A real-mode machine, the way QEMU's hvf_reset_vcpu describes one. */
 static void setup_real_mode(hv_vcpuid_t v, uint16_t ip)
 {
@@ -162,6 +165,7 @@ int main(void)
     memcpy(ram + 0x1100, kMessage, sizeof(kMessage));
     memcpy(ram + 0x1200, kProg2, sizeof(kProg2));
     memcpy(ram + 0x1300, kProg3, sizeof(kProg3));
+    memcpy(ram + 0x1400, kProg4, sizeof(kProg4));
 
     printf("stage 1: setup\n");
     EXPECT(hv_vm_map(ram, 0, RAM_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) == HV_SUCCESS, "hv_vm_map of 1 MiB of RAM");
@@ -299,6 +303,18 @@ int main(void)
     pthread_join(th, NULL);
     EXPECT(kickResult == HV_SUCCESS, "hv_vcpu_interrupt from another thread succeeded");
     EXPECT(returns >= 3 && ext == returns, "hv_vcpu_run kept coming back with an external-interrupt exit (%d times)", returns);
+
+    printf("stage 4b: a guest WRMSR to a native TSC (HyperKit makes the TSC native)\n");
+    EXPECT(hv_vcpu_enable_native_msr(v, 0x10, true) == HV_SUCCESS, "hv_vcpu_enable_native_msr(TSC)");
+    setup_real_mode(v, 0x1400);
+    r = run_skip_irq(v);
+    EXPECT(r == HV_SUCCESS && (rvmcs(v, VMCS_RO_EXIT_REASON) & 0xFFFF) == VMX_REASON_HLT,
+           "the TSC write needed no help from the client, the guest reached HLT (exit reason %" PRIu64 ")", rvmcs(v, VMCS_RO_EXIT_REASON) & 0xFFFF);
+    {
+        uint64_t w = ((rreg(v, HV_X86_RBP) & 0xFFFFFFFFull) << 32) | (rreg(v, HV_X86_RBX) & 0xFFFFFFFFull);
+        uint64_t after = ((rreg(v, HV_X86_RDX) & 0xFFFFFFFFull) << 32) | (rreg(v, HV_X86_RAX) & 0xFFFFFFFFull);
+        EXPECT(after >= w && after - w < 2000000000ull, "the guest's TSC after the write continues from the written value (+%" PRIu64 " cycles)", after - w);
+    }
 
     printf("stage 5: error codes\n");
     EXPECT(hv_vm_map(ram + 1, 0x200000, PAGE, HV_MEMORY_READ) != HV_SUCCESS, "an unaligned address is refused");

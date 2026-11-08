@@ -258,7 +258,7 @@ uint32_t usableCount()
  * mach_absolute_time differs between those cores and kernel code that compares timestamps taken on two cores (fq_codel's
  * "now >= *pkt_enq_time") can panic. The same method as Linux's check_tsc_warp.
  */
-constexpr unsigned kTscRounds = 300;
+constexpr unsigned kTscRounds = 128;   /* 24 CPUs: about 3 ms with interrupts off everywhere (300 took 5-9 ms) */
 volatile uint32_t  gTscLock;
 uint64_t           gTscLast;
 int32_t            gTscLastCpu;
@@ -302,7 +302,7 @@ void tscAction(void *)
     }
 }
 
-void tscCallFn(thread_call_param_t why, thread_call_param_t)
+void tscCallFn(thread_call_param_t, thread_call_param_t why)   /* param0 is thread_call_allocate's, param1 thread_call_enter1's */
 {
     rhv::svm::checkTsc((const char *)why, nullptr);
 }
