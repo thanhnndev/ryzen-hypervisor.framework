@@ -30,7 +30,7 @@ COMMON  := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=10.15 \
            -mkernel -nostdinc -nostdlibinc \
            -I$(KFW)/Headers -I$(KFW)/PrivateHeaders \
            -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
-           -Wall -Wextra $(OPT)
+           -Wall -Wextra $(OPT) -MMD -MP
 
 CXXFLAGS := $(COMMON) -std=gnu++17 -fapple-kext -fno-exceptions -fno-rtti -fno-builtin
 CFLAGS   := $(COMMON) -fno-builtin
@@ -50,6 +50,11 @@ $(OBJDIR)/%.o: Source/%.c
 $(OBJDIR)/%.o: Source/%.S
 	@mkdir -p $(OBJDIR)
 	xcrun clang -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=10.15 -c $< -o $@
+
+# Header dependencies (.d files from -MMD). Without them an object whose .cpp did not change kept an old struct layout:
+# 0.7.18 grew RHVStats in include/RyzenHVShared.h, Log.cpp was not rebuilt, gStats stayed 200 bytes and the new counters
+# were written over the metaclass objects that follow it (two kernel panics).
+-include $(OBJS:.o=.d)
 
 $(KEXT): $(OBJS) Info.plist
 	rm -rf $(KEXT)
