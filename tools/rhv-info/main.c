@@ -130,11 +130,15 @@ static int cmd_stats(io_connect_t conn)
     memset(&s, 0, sizeof(s));
     size_t outSize = sizeof(s);
     kern_return_t kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
-    if (kr != KERN_SUCCESS) {                    /* a kext before 0.7.18 has the shorter struct, without the profiling sums */
+    if (kr != KERN_SUCCESS) {                    /* an older kext has a shorter struct (each layout is a prefix of the next) */
+        outSize = RHV_STATS_SIZE_V2;
+        kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
+    }
+    if (kr != KERN_SUCCESS) {
         outSize = RHV_STATS_SIZE_V1;
         kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
     }
-    if (kr != KERN_SUCCESS || (outSize != sizeof(s) && outSize != RHV_STATS_SIZE_V1)) {
+    if (kr != KERN_SUCCESS || (outSize != sizeof(s) && outSize != RHV_STATS_SIZE_V2 && outSize != RHV_STATS_SIZE_V1)) {
         fprintf(stderr, "GetStats failed: 0x%x (size %zu, expected %zu)\n", kr, outSize, sizeof(s));
         return 1;
     }
@@ -166,7 +170,7 @@ static int cmd_stats(io_connect_t conn)
     P(vmNptFaults);
     P(vmPagesMapped);
     P(vmFpuMismatches);
-    if (outSize == sizeof(s)) {
+    if (outSize >= RHV_STATS_SIZE_V2) {
         P(vmCycTrap);
         P(vmTraps);
         P(vmCycRun);
@@ -174,6 +178,11 @@ static int cmd_stats(io_connect_t conn)
         P(vmCycGuest);
         P(vmCycPost);
         P(vmProfExits);
+        if (outSize == sizeof(s)) {
+            P(vmCycFeIn);
+            P(vmCycRunEx);
+            P(vmCycFeOut);
+        }
         if (s.vmTraps && s.vmProfExits) {
             /* per hv_vcpu_run trap and per VMRUN, in microseconds at the TSC rate */
             uint64_t hz = 0;
@@ -182,6 +191,10 @@ static int cmd_stats(io_connect_t conn)
             double us = hz ? 1e6 / (double)hz : 0;
             printf("  per trap        : %.2f us (run %.2f us), %.2f VMRUNs per trap\n", s.vmCycTrap * us / s.vmTraps,
                    s.vmCycRun * us / s.vmTraps, (double)s.vmProfExits / s.vmTraps);
+            if (outSize == sizeof(s))
+                printf("  trap split      : front end in %.2f us, runEx %.2f us (run %.2f), front end out %.2f us\n",
+                       s.vmCycFeIn * us / s.vmTraps, s.vmCycRunEx * us / s.vmTraps, s.vmCycRun * us / s.vmTraps,
+                       s.vmCycFeOut * us / s.vmTraps);
             printf("  per VMRUN       : pre %.2f us, guest+switch %.2f us, post %.2f us\n", s.vmCycPre * us / s.vmProfExits,
                    s.vmCycGuest * us / s.vmProfExits, s.vmCycPost * us / s.vmProfExits);
         }

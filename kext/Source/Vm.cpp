@@ -566,6 +566,16 @@ bool com_overlorddev_RyzenHVVm::init()
     fHaveNextRip = false;
     bzero(fProf, sizeof(fProf));
     fFpuCheckCount = 0;
+    {
+        /* Where each field runEx reports lives, worked out once instead of after every exit. */
+        static const uint32_t kRun[RHV_RUN_NFIELDS] = {
+#define RHV_X(enc) enc,
+            RHV_RUN_FIELDS_LIST(RHV_X)
+#undef RHV_X
+        };
+        for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++)
+            fRunPlan[i] = rhv::vmx::VmcsState::plan(kRun[i]);
+    }
 
     fLock = IOLockAlloc();
     return fLock != nullptr;
@@ -821,6 +831,9 @@ void com_overlorddev_RyzenHVVm::profFlush()
     RHV_STAT_ADD(vmCycGuest, fProf[kProfGuest]);
     RHV_STAT_ADD(vmCycPost, fProf[kProfPost]);
     RHV_STAT_ADD(vmProfExits, fProf[kProfExits]);
+    RHV_STAT_ADD(vmCycFeIn, fProf[kProfFeIn]);
+    RHV_STAT_ADD(vmCycRunEx, fProf[kProfRunEx]);
+    RHV_STAT_ADD(vmCycFeOut, fProf[kProfFeOut]);
     bzero(fProf, sizeof(fProf));
 }
 
@@ -1331,6 +1344,15 @@ IOReturn com_overlorddev_RyzenHVVm::getFpu(RHVFpuState *out)
     return kIOReturnSuccess;
 }
 
+uint64_t com_overlorddev_RyzenHVVm::copyGuestFpu(void *dst, uint32_t max)
+{
+    IOLockLock(fLock);
+    const uint64_t xcr0 = fGuestXcr0;
+    bcopy(fGuestFpu.va, dst, fFpuSize < max ? fFpuSize : max);
+    IOLockUnlock(fLock);
+    return xcr0;
+}
+
 IOReturn com_overlorddev_RyzenHVVm::setFpu(const RHVFpuState *in)
 {
     /* Everything XRSTOR or XSETBV would fault on is refused here: a fault in the kernel is a panic. */
@@ -1399,11 +1421,13 @@ IOReturn com_overlorddev_RyzenHVVm::runEx(const RHVRunIn *in, RHVRunOut *out)
     }
 
     getRegs(&out->regs);
-    unsigned n = 0;
     IOLockLock(fLock);                                    /* one lock for all the fields, not one per field */
-#define RHV_X(enc) do { uint64_t v_ = 0; if (fVmx) (void)fVmcs.read(enc, &v_); out->fields[n++] = v_; } while (0);
-    RHV_RUN_FIELDS_LIST(RHV_X)
-#undef RHV_X
+    for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++) {
+        uint64_t v_ = 0;
+        if (fVmx)
+            (void)fVmcs.readPlanned(fRunPlan[i], &v_);
+        out->fields[i] = v_;
+    }
     IOLockUnlock(fLock);
     return kIOReturnSuccess;
 }

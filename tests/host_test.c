@@ -115,8 +115,9 @@ int main(void)
 
     /* Struct layouts are part of the kext/userland ABI. */
     CHECK(sizeof(RHVInfo) == 14 * sizeof(uint32_t));
-    CHECK(sizeof(RHVStats) == RHV_STATS_SIZE && RHV_STATS_SIZE == 32 * sizeof(uint64_t));
-    CHECK(offsetof(RHVStats, vmCycTrap) == RHV_STATS_SIZE_V1);   /* the old layout is a prefix of the new one */
+    CHECK(sizeof(RHVStats) == RHV_STATS_SIZE && RHV_STATS_SIZE == 35 * sizeof(uint64_t));
+    CHECK(offsetof(RHVStats, vmCycTrap) == RHV_STATS_SIZE_V1);   /* the old layouts are prefixes of the new one */
+    CHECK(offsetof(RHVStats, vmCycFeIn) == RHV_STATS_SIZE_V2);
     CHECK(sizeof(RHVRegs) == 18 * sizeof(uint64_t));
     CHECK(sizeof(RHVExit) == 48);
     CHECK(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE);

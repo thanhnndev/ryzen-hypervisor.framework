@@ -141,12 +141,41 @@ public:
     uint64_t dr(unsigned i) const { return fDr[i & 3]; }
     void     setDr(unsigned i, uint64_t v) { fDr[i & 3] = v; }
 
+    /*
+     * A field's place, worked out once. read() costs a binary search over the field table plus mapField's scans; the front
+     * end reads the same 55 fields after every VM exit, so it keeps a plan for each (RunPlan in Vm.cpp) and calls readPlanned.
+     */
+    struct ReadPlan {
+        uint32_t enc;
+        int      idx;          /* fieldIndex(enc), -1 for an extension field */
+        StateMap map;
+        bool     valid;
+    };
+    static ReadPlan plan(uint32_t enc)
+    {
+        ReadPlan p;
+        p.enc   = enc;
+        p.idx   = fieldIndex(enc);
+        p.valid = p.idx >= 0 || isExtField(enc);
+        p.map   = p.valid ? mapField(enc) : StateMap{};
+        return p;
+    }
+    Result readPlanned(const ReadPlan &p, uint64_t *out) const
+    {
+        return p.valid ? readMapped(p.enc, p.idx, p.map, out) : R_INVALID_FIELD;
+    }
+
     Result read(uint32_t enc, uint64_t *out) const
     {
         int idx = fieldIndex(enc);
         if (idx < 0 && !isExtField(enc))
             return R_INVALID_FIELD;
-        StateMap m = mapField(enc);
+        return readMapped(enc, idx, mapField(enc), out);
+    }
+
+private:
+    Result readMapped(uint32_t enc, int idx, const StateMap &m, uint64_t *out) const
+    {
         switch (m.kind) {
         case KIND_EXT_DR:
             *out = fDr[m.vmcbOff];
@@ -182,6 +211,7 @@ public:
         }
     }
 
+public:
     Result write(uint32_t enc, uint64_t value)
     {
         int idx = fieldIndex(enc);

@@ -185,6 +185,7 @@ struct HvVcpu {
     uint8_t  managedIdx[256];  /* position in the list -> MSR cache index, 0 = a hole */
     uint64_t applied[144];     /* the last value handed to the core for each MSR cache index */
     uint8_t  appliedKnown[144];
+    uint64_t tRunEx0, tRunEx1;   /* profiling: when runEx started and returned in this trap (0: no run) */
 };
 struct HvVm {
     IOLock *lock;
@@ -562,11 +563,8 @@ constexpr unsigned R_XCR0 = 50, R_DR0 = 41, R_DR4 = 45, R_DR5 = 46, R_DR6 = 47; 
 /* The core's FP state and XCR0 into the page: the ro FP array (what hv_vcpu_read_fpstate reads) and the XCR0 register. */
 void fpuToPage(HvVcpu *v)
 {
-    v->cpu->getFpu(&v->fpu);
     uint8_t *dst = v->vm->kva[1] + kRoFpOff + v->id * v->vm->fpStride;
-    uint32_t n = v->fpu.size < v->vm->fpStride ? v->fpu.size : v->vm->fpStride;
-    bcopy(v->fpu.area, dst, n);
-    *gprWord(v, R_XCR0) = v->fpu.xcr0;
+    *gprWord(v, R_XCR0) = v->cpu->copyGuestFpu(dst, v->vm->fpStride);
 }
 
 /* Thread trap 7: the client read a slot that is not valid in its cache: ask the SVM core for the field and put it there. */
@@ -966,8 +964,11 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
     if (!v)
         return kHvNoDev;
     const uint64_t t0 = __builtin_ia32_rdtsc();
+    v->tRunEx0 = v->tRunEx1 = 0;
     const kern_return_t kr = vcpuRunBody(v, arg);
-    v->cpu->profTrap(__builtin_ia32_rdtsc() - t0);
+    const uint64_t t1 = __builtin_ia32_rdtsc();
+    if (v->tRunEx1)                                   /* the run happened: split the trap up */
+        v->cpu->profTrap(t1 - t0, v->tRunEx0 - t0, v->tRunEx1 - v->tRunEx0);
     return kr;
 }
 
@@ -1193,7 +1194,9 @@ static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg)
         }
     }
     const uint64_t inRax = regs.rax, inRcx = regs.rcx, inRdx = regs.rdx;       /* what the client set before this entry */
+    v->tRunEx0 = __builtin_ia32_rdtsc();
     IOReturn rc = cpu->runEx(&v->in, &v->out);
+    v->tRunEx1 = __builtin_ia32_rdtsc();
     if (rc != kIOReturnSuccess) {
         static volatile SInt32 failed;
         if (!v->vm->hyperkit && OSIncrementAtomic(&failed) < 30)

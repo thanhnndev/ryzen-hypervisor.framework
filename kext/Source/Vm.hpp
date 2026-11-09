@@ -144,10 +144,20 @@ public:
     void     kick();
 
     IOReturn getFpu(RHVFpuState *out);
+    /* The guest's XSAVE image straight into `dst` (at most `max` bytes, the rest of `dst` untouched); returns its XCR0. For the
+     * front end after every exit: no zeroed 3 KiB staging copy in between. */
+    uint64_t copyGuestFpu(void *dst, uint32_t max);
     IOReturn setFpu(const RHVFpuState *in);
 
     /* The front end's hv_vcpu_run trap took `cycles` TSC cycles (profiling, see RHVStats.vmCycTrap). Same thread as run(). */
-    void     profTrap(uint64_t cycles) { fProf[kProfTrap] += cycles; fProf[kProfTraps]++; }
+    void     profTrap(uint64_t cycles, uint64_t feIn, uint64_t runEx)
+    {
+        fProf[kProfTrap] += cycles;
+        fProf[kProfTraps]++;
+        fProf[kProfFeIn] += feIn;
+        fProf[kProfRunEx] += runEx;
+        fProf[kProfFeOut] += cycles - feIn - runEx;
+    }
 
 private:
     bool     setup(uint32_t flags);
@@ -175,10 +185,11 @@ private:
     bool                      fHaveNextRip;
 
     /* Profiling sums of this vCPU, added to rhv::gStats every kProfFlush exits (one atomic per field, not per exit). */
-    enum { kProfTrap, kProfTraps, kProfRun, kProfPre, kProfGuest, kProfPost, kProfExits, kProfCount };
+    enum { kProfTrap, kProfTraps, kProfRun, kProfPre, kProfGuest, kProfPost, kProfExits, kProfFeIn, kProfRunEx, kProfFeOut, kProfCount };
     static const uint32_t     kProfFlush = 1024;
     uint64_t                  fProf[kProfCount];
     uint32_t                  fFpuCheckCount;    /* the host FPU self-check runs on one VMRUN in 64 */
+    rhv::vmx::VmcsState::ReadPlan fRunPlan[RHV_RUN_NFIELDS];   /* the fields runEx reports, located once */
     void                      profFlush();
 };
 
