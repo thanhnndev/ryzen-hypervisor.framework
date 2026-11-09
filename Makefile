@@ -55,6 +55,8 @@ tools: | $(BUILD)
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-tsc-check tools/rhv-tsc-check/main.c
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-smoke tools/hvf-smoke/main.c \
 		-framework Hypervisor
+	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-exit-bench tools/hvf-exit-bench/main.c \
+		-framework Hypervisor
 
 SHIM_SRC := shim/hv_shim.c shim/rhv_core.c shim/rhv_iokit.c shim/rhv_patch.c
 

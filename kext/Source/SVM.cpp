@@ -620,6 +620,11 @@ int ensureThisCpu()
     return 1;
 }
 
+bool flushByAsid(int cpu)
+{
+    return cpu >= 0 && cpu < RHV_MAX_CPUS && gSeenCpu[cpu] && ((gProbe[cpu].features >> 6) & 1);
+}
+
 uint32_t healedCount()
 {
     return (uint32_t)gHealed;

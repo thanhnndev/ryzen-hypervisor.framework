@@ -958,12 +958,22 @@ void dbgRecord(HvVcpu *v)
     }
 }
 
+static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg);
+
 kern_return_t tVcpuRun(void *target, uint64_t arg)
 {
-    note(HV_THREAD_TRAP, 0, arg);
     HvVcpu *v = static_cast<HvVcpu *>(target);
     if (!v)
         return kHvNoDev;
+    const uint64_t t0 = __builtin_ia32_rdtsc();
+    const kern_return_t kr = vcpuRunBody(v, arg);
+    v->cpu->profTrap(__builtin_ia32_rdtsc() - t0);
+    return kr;
+}
+
+static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg)
+{
+    note(HV_THREAD_TRAP, 0, arg);
     com_overlorddev_RyzenHVVm *cpu = v->cpu;
 
     /* 1. What the client changed since the last run: registers from the page, VMCS fields from the dirty slots. */

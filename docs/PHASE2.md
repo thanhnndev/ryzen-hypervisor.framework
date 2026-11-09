@@ -41,8 +41,9 @@ VmMap(uva, gpa, size, flags)
   changes all of them; otherwise it changes nothing (`kIOReturnNotFound`).
 - Empty page tables are freed immediately (`Npt::prune`), so a VM with everything removed
   holds a single root page.
-- TLB: `tlbCtl = FLUSH_ALL` on every `VMRUN`, so no separate invalidations are needed after
-  `unmap`/`protect`. Tables may be changed only while the guest is not running: `VmRun` holds
+- TLB: the guest's TLB entries (ASID 1) are flushed on every `VMRUN`, so no separate invalidations are needed after
+  `unmap`/`protect`. Since 0.7.18 that is `TLB_FLUSH_GUEST` (flush by ASID) where the CPU has FlushByAsid, so the host's own
+  entries survive the round trip; `FLUSH_ALL` otherwise. Tables may be changed only while the guest is not running: `VmRun` holds
   the same lock.
 - `VmMap` accepts an address only from the process that opened the connection (`current_task() == owner`).
   Otherwise a process that was handed the connection port could pin other people's addresses.

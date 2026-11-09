@@ -146,6 +146,9 @@ public:
     IOReturn getFpu(RHVFpuState *out);
     IOReturn setFpu(const RHVFpuState *in);
 
+    /* The front end's hv_vcpu_run trap took `cycles` TSC cycles (profiling, see RHVStats.vmCycTrap). Same thread as run(). */
+    void     profTrap(uint64_t cycles) { fProf[kProfTrap] += cycles; fProf[kProfTraps]++; }
+
 private:
     bool     setup(uint32_t flags);
     void     resetLocked(uint16_t cs, uint16_t ip);
@@ -170,6 +173,13 @@ private:
     rhv::GuestGprs            fGprs;
     bool                      fFirstRun;
     bool                      fHaveNextRip;
+
+    /* Profiling sums of this vCPU, added to rhv::gStats every kProfFlush exits (one atomic per field, not per exit). */
+    enum { kProfTrap, kProfTraps, kProfRun, kProfPre, kProfGuest, kProfPost, kProfExits, kProfCount };
+    static const uint32_t     kProfFlush = 1024;
+    uint64_t                  fProf[kProfCount];
+    uint32_t                  fFpuCheckCount;    /* the host FPU self-check runs on one VMRUN in 64 */
+    void                      profFlush();
 };
 
 #endif /* RYZENHV_VM_HPP */

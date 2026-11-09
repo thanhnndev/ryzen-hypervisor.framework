@@ -562,6 +562,8 @@ bool com_overlorddev_RyzenHVVm::init()
     fRunCpu        = -1;
     fFirstRun    = true;
     fHaveNextRip = false;
+    bzero(fProf, sizeof(fProf));
+    fFpuCheckCount = 0;
 
     fLock = IOLockAlloc();
     return fLock != nullptr;
@@ -808,10 +810,23 @@ void com_overlorddev_RyzenHVVm::kick()
         mp_cpus_call(1ull << cpu, 2 /* NOSYNC */, kickAction, nullptr);
 }
 
+void com_overlorddev_RyzenHVVm::profFlush()
+{
+    RHV_STAT_ADD(vmCycTrap, fProf[kProfTrap]);
+    RHV_STAT_ADD(vmTraps, fProf[kProfTraps]);
+    RHV_STAT_ADD(vmCycRun, fProf[kProfRun]);
+    RHV_STAT_ADD(vmCycPre, fProf[kProfPre]);
+    RHV_STAT_ADD(vmCycGuest, fProf[kProfGuest]);
+    RHV_STAT_ADD(vmCycPost, fProf[kProfPost]);
+    RHV_STAT_ADD(vmProfExits, fProf[kProfExits]);
+    bzero(fProf, sizeof(fProf));
+}
+
 IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 {
     IOReturn rc = kIOReturnSuccess;
     Vmcb *v = (Vmcb *)fVmcb.va;
+    const uint64_t tRun0 = __builtin_ia32_rdtsc();
 
     IOLockLock(fLock);
     RHV_STAT_INC(vmRuns);
@@ -871,6 +886,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     bool sleepWait  = false;          /* SVM is off for sleep: wait a little before going back to the client */
 
     for (;;) {
+        const uint64_t tPre0 = __builtin_ia32_rdtsc();
         if (needRescan) {             /* outside the page-table lock and with interrupts on: it runs a rendezvous and may allocate */
             needRescan = false;
             svm::rescan();
@@ -902,7 +918,6 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
 
         v->control.exitCode = 0;
-        v->control.tlbCtl   = TLB_FLUSH_ALL;
         v->control.clean    = 0;      /* every field is dirty, we never use clean bits yet */
 
         uint64_t hostCr2;
@@ -966,6 +981,12 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             rc = kIOReturnNotReady;
             break;
         }
+        /*
+         * Every entry flushes the guest's TLB entries (all vCPUs of all VMs share ASID 1, and a vCPU moves between CPUs). Up to 0.7.17
+         * this was TLB_FLUSH_ALL, which also flushes the host's entries (ASID 0, global pages too): after every exit the macOS kernel and
+         * the client refilled their TLB. Flushing ASID 1 alone gives the guest exactly the same guarantee.
+         */
+        v->control.tlbCtl = svm::flushByAsid(runCpu) ? TLB_FLUSH_GUEST : TLB_FLUSH_ALL;
 
         /*
          * VMRUN does not touch x87/SSE/AVX state or XCR0. Swap them by hand, still with interrupts off, so
@@ -1003,45 +1024,79 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         if (fVmx) {
             hostDr[0] = rhv_read_dr(0); hostDr[1] = rhv_read_dr(1); hostDr[2] = rhv_read_dr(2);
             hostDr[3] = rhv_read_dr(3); hostDr[4] = rhv_read_dr(6); hostDr[5] = rhv_read_dr(7);
-            rhv_write_dr(7, 0);                       /* no breakpoint can fire while the registers change */
-            for (unsigned i = 0; i < 4; i++)
-                rhv_write_dr(i, fVmcs.dr(i));
+            /* Writes to debug registers are slow and nearly always useless here (host and guest both 0): write only what differs. */
+            bool dr7Off = false;
+            for (unsigned i = 0; i < 4; i++) {
+                const uint64_t g = fVmcs.dr(i);
+                if (g == hostDr[i])
+                    continue;
+                if (!dr7Off) {
+                    rhv_write_dr(7, 0);               /* no breakpoint can fire while the registers change */
+                    dr7Off = true;
+                }
+                rhv_write_dr(i, g);
+            }
         }
 
         /* RDTSCP reads IA32_TSC_AUX, which VMRUN does not switch: put the guest's value in for the run. */
         uint64_t hostTscAux = 0;
         if (fVmx && fHasTscAux) {
             hostTscAux = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);
-            rhv_wrmsr(rhv::msr::MSR_TSC_AUX, fVmcs.tscAux());
+            if (fVmcs.tscAux() != hostTscAux)
+                rhv_wrmsr(rhv::msr::MSR_TSC_AUX, fVmcs.tscAux());
         }
 
+        const uint64_t tGuest0 = __builtin_ia32_rdtsc();
         rhv_svm_vmrun(&fGprs, fVmcb.pa, fHostVmcb.pa);
+        const uint64_t tGuest1 = __builtin_ia32_rdtsc();
         fRunCpu = -1;
 
         if (fVmx && fHasTscAux) {
-            fVmcs.setTscAux(rhv_rdmsr(rhv::msr::MSR_TSC_AUX));
-            rhv_wrmsr(rhv::msr::MSR_TSC_AUX, hostTscAux);
+            const uint64_t g = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);
+            fVmcs.setTscAux(g);
+            if (g != hostTscAux)
+                rhv_wrmsr(rhv::msr::MSR_TSC_AUX, hostTscAux);
         }
 
         if (fVmx) {
-            for (unsigned i = 0; i < 4; i++)
-                fVmcs.setDr(i, rhv_read_dr(i));
-            rhv_write_dr(7, 0);
-            rhv_write_dr(0, hostDr[0]); rhv_write_dr(1, hostDr[1]); rhv_write_dr(2, hostDr[2]);
-            rhv_write_dr(3, hostDr[3]); rhv_write_dr(6, hostDr[4]); rhv_write_dr(7, hostDr[5]);
+            bool dr7Off = false;
+            for (unsigned i = 0; i < 4; i++) {
+                const uint64_t g = rhv_read_dr(i);
+                fVmcs.setDr(i, g);
+                if (g == hostDr[i])
+                    continue;
+                if (!dr7Off) {
+                    rhv_write_dr(7, 0);
+                    dr7Off = true;
+                }
+                rhv_write_dr(i, hostDr[i]);
+            }
+            if (rhv_read_dr(6) != hostDr[4])
+                rhv_write_dr(6, hostDr[4]);
+            if (dr7Off || rhv_read_dr(7) != hostDr[5])     /* #VMEXIT leaves DR7 at its reset value */
+                rhv_write_dr(7, hostDr[5]);
         }
 
         rhv::fpu::xsave(fGuestFpu.va, guestX);
         if (guestX != hostX)
             rhv::fpu::xsetbv0(hostX);
         rhv::fpu::xrstor(fHostFpu.va, hostX);
-        /* Self-check: the host state must be bit for bit what it was (this code uses no SSE of its own). */
-        rhv::fpu::xsave(fScratchFpu.va, hostX);
-        if (!rhv::fpu::legacyEqual((const uint8_t *)fHostFpu.va, (const uint8_t *)fScratchFpu.va))
-            RHV_STAT_INC(vmFpuMismatches);
+        /* Self-check: the host state must be bit for bit what it was (this code uses no SSE of its own). One run in 64: it is a third XSAVE. */
+        if ((fFpuCheckCount++ & 63) == 0) {
+            rhv::fpu::xsave(fScratchFpu.va, hostX);
+            if (!rhv::fpu::legacyEqual((const uint8_t *)fHostFpu.va, (const uint8_t *)fScratchFpu.va))
+                RHV_STAT_INC(vmFpuMismatches);
+        }
         rhv::fpu::restoreTs(wasTs);
 
         __asm__ volatile("movq %0, %%cr2" : : "r"(hostCr2));
+        {
+            const uint64_t tPost1 = __builtin_ia32_rdtsc();
+            fProf[kProfPre]   += tGuest0 - tPre0;
+            fProf[kProfGuest] += tGuest1 - tGuest0;
+            fProf[kProfPost]  += tPost1 - tGuest1;
+            fProf[kProfExits]++;
+        }
         ml_set_interrupts_enabled(ints);   /* a pending host interrupt is taken right here */
 
         if (svmFix > 0) {
@@ -1208,6 +1263,9 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
     }
 
+    fProf[kProfRun] += __builtin_ia32_rdtsc() - tRun0;
+    if (fProf[kProfExits] >= kProfFlush)
+        profFlush();
     IOLockUnlock(fLock);
     return rc;
 }

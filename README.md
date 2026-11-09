@@ -106,6 +106,11 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
 - Docker Desktop using a core or more while idle, `com.docker.backend.log` full of `wrmsr to register 0xc0000502(0x1)`: on Zen 5 the host
   CPUID 0x80000021 EAX bit 22 (workload classification) reached the guest, and Linux writes MSR 0xC0000502 on every context switch,
   which HyperKit does not know and logs. Since 0.7.17 RyzenHV clears the bit in HyperKit's CPUID answers (restart Docker Desktop).
+- An idle Docker VM still costs the host CPU: a Linux guest with many vCPUs takes thousands of timer interrupts and scheduler wake-up
+  IPIs a second, and in xAPIC mode each costs several exits to HyperKit (APIC accesses are nested page faults), ~50k exits/s for 24 vCPUs.
+  What one exit costs: `env DYLD_INSERT_LIBRARIES=$PWD/build/libryzenhv.dylib build/hvf-exit-bench`. Where the time goes in the kext
+  (0.7.18 and later): `rhv-info stats`, lines "per trap" and "per VMRUN". Since 0.7.18 a VMRUN flushes only the guest's TLB entries
+  (before, the host's TLB was flushed on every exit too) and skips debug-register and TSC_AUX writes that change nothing.
 
 ### For every VM
 

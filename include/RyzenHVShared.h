@@ -248,7 +248,15 @@ typedef struct RHVStats {
     uint64_t vmProtects;
     uint64_t vmNptFaults;        /* RHV_EXIT_NPF handed to userland */
     uint64_t vmPagesMapped;      /* guest pages currently mapped, summed over VMs */
-    uint64_t vmFpuMismatches;    /* host x87/SSE state differed after a VMRUN round trip: must stay 0 */
+    uint64_t vmFpuMismatches;    /* host x87/SSE state differed after a VMRUN round trip: must stay 0 (checked on one run in 64 since 0.7.18) */
+    /* Since 0.7.18: where the time of a run goes, in TSC cycles, summed over all vCPUs (flushed every 1024 exits per vCPU). */
+    uint64_t vmCycTrap;          /* Hypervisor.framework thread trap hv_vcpu_run, whole (front end + run) */
+    uint64_t vmTraps;            /* those traps */
+    uint64_t vmCycRun;           /* VmRun, whole */
+    uint64_t vmCycPre;           /* loop iteration up to VMRUN: locks, checks, FPU/DR/TSC_AUX swap in */
+    uint64_t vmCycGuest;         /* VMRUN to #VMEXIT: the guest itself plus the world switch */
+    uint64_t vmCycPost;          /* #VMEXIT until interrupts are back on: swap out */
+    uint64_t vmProfExits;        /* exits counted in the sums above */
 } RHVStats;
 
 /* Guest registers as seen by userland (VmGetRegs / VmSetRegs). */
@@ -374,7 +382,7 @@ typedef struct RHVLogChunk {
 
 /* Compile-time size checks that work in both C and C++. */
 typedef char rhv_assert_log_chunk_size[(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE) ? 1 : -1];
-typedef char rhv_assert_stats_size[(sizeof(RHVStats) == 25 * sizeof(uint64_t)) ? 1 : -1];
+typedef char rhv_assert_stats_size[(sizeof(RHVStats) == 32 * sizeof(uint64_t)) ? 1 : -1];
 typedef char rhv_assert_regs_size[(sizeof(RHVRegs) == 18 * sizeof(uint64_t)) ? 1 : -1];
 typedef char rhv_assert_fpu_size[(sizeof(RHVFpuState) == 16 + RHV_FPU_AREA_MAX) ? 1 : -1];
 typedef char rhv_assert_exit_size[(sizeof(RHVExit) == 48) ? 1 : -1];
