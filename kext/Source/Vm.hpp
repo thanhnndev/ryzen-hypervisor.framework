@@ -182,4 +182,8 @@ private:
     void                      profFlush();
 };
 
+#include "AbiStamp.hpp"
+RHV_ABI_STAMP(com_overlorddev_RyzenHVVm)
+RHV_ABI_STAMP(com_overlorddev_RyzenHVVmShared)
+
 #endif /* RYZENHV_VM_HPP */

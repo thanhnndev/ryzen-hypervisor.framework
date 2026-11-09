@@ -445,4 +445,7 @@ private:
 } // namespace vmx
 } // namespace rhv
 
+#include "AbiStamp.hpp"
+RHV_ABI_STAMP_AS(VmcsState, rhv::vmx::VmcsState)
+
 #endif /* RYZENHV_VMCSSTATE_HPP */

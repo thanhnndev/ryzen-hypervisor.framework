@@ -2,6 +2,7 @@
  * Host-side unit test for the pure helpers in RyzenHVShared.h.
  * Builds with any C compiler, no macOS SDK needed:  make test
  */
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -114,7 +115,8 @@ int main(void)
 
     /* Struct layouts are part of the kext/userland ABI. */
     CHECK(sizeof(RHVInfo) == 14 * sizeof(uint32_t));
-    CHECK(sizeof(RHVStats) == 32 * sizeof(uint64_t));
+    CHECK(sizeof(RHVStats) == RHV_STATS_SIZE && RHV_STATS_SIZE == 32 * sizeof(uint64_t));
+    CHECK(offsetof(RHVStats, vmCycTrap) == RHV_STATS_SIZE_V1);   /* the old layout is a prefix of the new one */
     CHECK(sizeof(RHVRegs) == 18 * sizeof(uint64_t));
     CHECK(sizeof(RHVExit) == 48);
     CHECK(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE);

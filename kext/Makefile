@@ -65,6 +65,7 @@ $(KEXT): $(OBJS) Info.plist
 		-o $(KEXT)/Contents/MacOS/RyzenHV $(OBJS) \
 		-lkmodc++ -lkmod -lcc_kext
 	../scripts/check-kext-symbols.sh $(KEXT)
+	../scripts/check-kext-abi.sh $(KEXT)
 	@echo "Built $(KEXT)"
 	@echo "OpenCore loads it unsigned via Kernel -> Add, see docs/RYZENTOSH.md"
 

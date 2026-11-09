@@ -382,7 +382,10 @@ typedef struct RHVLogChunk {
 
 /* Compile-time size checks that work in both C and C++. */
 typedef char rhv_assert_log_chunk_size[(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE) ? 1 : -1];
-typedef char rhv_assert_stats_size[(sizeof(RHVStats) == 32 * sizeof(uint64_t)) ? 1 : -1];
+/* RHVStats size. The stats call accepts exactly this size or RHV_STATS_SIZE_V1 (before 0.7.18) and copies only what the caller asked for. */
+#define RHV_STATS_SIZE    (32 * 8)
+#define RHV_STATS_SIZE_V1 (25 * 8)
+typedef char rhv_assert_stats_size[(sizeof(RHVStats) == RHV_STATS_SIZE) ? 1 : -1];
 typedef char rhv_assert_regs_size[(sizeof(RHVRegs) == 18 * sizeof(uint64_t)) ? 1 : -1];
 typedef char rhv_assert_fpu_size[(sizeof(RHVFpuState) == 16 + RHV_FPU_AREA_MAX) ? 1 : -1];
 typedef char rhv_assert_exit_size[(sizeof(RHVExit) == 48) ? 1 : -1];
@@ -442,6 +445,19 @@ static inline int rhv_is_amd_vendor(uint32_t ebx, uint32_t ecx, uint32_t edx)
 
 #ifdef __cplusplus
 }
+#endif
+
+#if defined(KERNEL) && defined(__cplusplus)
+/* Each kext object file records the sizes it was compiled with; scripts/check-kext-abi.sh compares them after the link. */
+#include "../kext/Source/AbiStamp.hpp"
+RHV_ABI_STAMP(RHVStats)
+RHV_ABI_STAMP(RHVInfo)
+RHV_ABI_STAMP(RHVRegs)
+RHV_ABI_STAMP(RHVExit)
+RHV_ABI_STAMP(RHVFpuState)
+RHV_ABI_STAMP(RHVRunIn)
+RHV_ABI_STAMP(RHVRunOut)
+RHV_ABI_STAMP(RHVLogChunk)
 #endif
 
 #endif /* RYZENHV_SHARED_H */

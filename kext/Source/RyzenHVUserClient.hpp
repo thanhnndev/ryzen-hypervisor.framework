@@ -61,4 +61,7 @@ private:
     bool                       fIsAdmin;
 };
 
+#include "AbiStamp.hpp"
+RHV_ABI_STAMP(com_overlorddev_RyzenHVUserClient)
+
 #endif /* RYZENHV_USERCLIENT_HPP */

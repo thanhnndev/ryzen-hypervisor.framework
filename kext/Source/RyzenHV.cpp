@@ -9,7 +9,7 @@
 
 #define super IOService
 
-#define RHV_VERSION "0.7.19"
+#define RHV_VERSION "0.7.20"
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHV, IOService)
 
@@ -193,10 +193,11 @@ void com_overlorddev_RyzenHV::getInfo(RHVInfo *out)
     *out = fInfo;
 }
 
-void com_overlorddev_RyzenHV::getStats(RHVStats *out)
+void com_overlorddev_RyzenHV::getStats(void *out, size_t size)
 {
+    static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
     rhv::gStats.logLevel = rhv::log::level();
-    *out = rhv::gStats;
+    bcopy(&rhv::gStats, out, size < sizeof(RHVStats) ? size : sizeof(RHVStats));
 }
 
 bool com_overlorddev_RyzenHV::runSelfTest(uint32_t *ok, uint32_t *total)

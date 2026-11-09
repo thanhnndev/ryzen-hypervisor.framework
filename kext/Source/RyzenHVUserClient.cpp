@@ -105,7 +105,7 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         /* kRHVMethodSetLogLevel: 1 scalar in (level) */
         { (IOExternalMethodAction)&C::sSetLogLevel, 1, 0, 0, 0 },
         /* kRHVMethodGetStats */
-        { (IOExternalMethodAction)&C::sGetStats, 0, 0, 0, sizeof(RHVStats) },
+        { (IOExternalMethodAction)&C::sGetStats, 0, 0, 0, kIOUCVariableStructureSize },   /* size checked in sGetStats */
         /* kRHVMethodSelfTest: 2 scalars out (ok, total) */
         { (IOExternalMethodAction)&C::sSelfTest, 0, 0, 2, 0 },
         /* kRHVMethodVmCreate: 1 scalar in (flags), 2 scalars out (built-in RAM size, VM id) */
@@ -287,9 +287,14 @@ IOReturn com_overlorddev_RyzenHVUserClient::sGetStats(OSObject *target, void *,
                                                       IOExternalMethodArguments *args)
 {
     RHV_ME();
-    RHVStats stats;
-    me->fOwner->getStats(&stats);
-    bcopy(&stats, args->structureOutput, sizeof(stats));
+    static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
+    /* The caller says which layout it was built with through its buffer size: this one, or the one before 0.7.18. Any other
+     * size is refused rather than guessed at, and only that many bytes are copied (no fixed-size buffer in between). */
+    const uint32_t size = args->structureOutputSize;
+    if (args->structureOutputDescriptor || !args->structureOutput || (size != RHV_STATS_SIZE && size != RHV_STATS_SIZE_V1))
+        return kIOReturnBadArgument;
+    me->fOwner->getStats(args->structureOutput, size);
+    args->structureOutputSize = size;
     return kIOReturnSuccess;
 }
 

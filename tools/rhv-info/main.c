@@ -131,10 +131,10 @@ static int cmd_stats(io_connect_t conn)
     size_t outSize = sizeof(s);
     kern_return_t kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
     if (kr != KERN_SUCCESS) {                    /* a kext before 0.7.18 has the shorter struct, without the profiling sums */
-        outSize = offsetof(RHVStats, vmCycTrap);
+        outSize = RHV_STATS_SIZE_V1;
         kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
     }
-    if (kr != KERN_SUCCESS || (outSize != sizeof(s) && outSize != offsetof(RHVStats, vmCycTrap))) {
+    if (kr != KERN_SUCCESS || (outSize != sizeof(s) && outSize != RHV_STATS_SIZE_V1)) {
         fprintf(stderr, "GetStats failed: 0x%x (size %zu, expected %zu)\n", kr, outSize, sizeof(s));
         return 1;
     }

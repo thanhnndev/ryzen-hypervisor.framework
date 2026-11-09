@@ -11,7 +11,7 @@ BUILD := build
 CC    ?= cc
 CXX   ?= c++
 
-.PHONY: all test tools shim hijack hijack-patchonly kext clean
+.PHONY: kext-release all test tools shim hijack hijack-patchonly kext clean
 
 all: tools shim kext
 
@@ -86,6 +86,11 @@ hijack-patchonly: | $(BUILD)
 		-o $(BUILD)/$(HIJACK_NAME) shim/hijack_patchonly.c shim/rhv_patch.c
 
 kext:
+	$(MAKE) -C kext
+
+# What goes onto an ESP: every object rebuilt from scratch, then the symbol and ABI checks (scripts/check-kext-*.sh).
+kext-release:
+	$(MAKE) -C kext clean
 	$(MAKE) -C kext
 
 clean:

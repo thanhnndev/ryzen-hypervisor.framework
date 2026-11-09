@@ -9,6 +9,8 @@
 #include "SVM.hpp"
 #include "X86.hpp"
 
+static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
+
 namespace {
 
 struct CpuProbe {

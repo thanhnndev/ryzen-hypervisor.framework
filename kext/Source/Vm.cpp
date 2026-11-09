@@ -7,6 +7,8 @@
 #include "SVM.hpp"
 #include "Vm.hpp"
 
+static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
+
 #define super OSObject
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHVVm, OSObject)
