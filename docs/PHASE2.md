@@ -41,10 +41,14 @@ VmMap(uva, gpa, size, flags)
   changes all of them; otherwise it changes nothing (`kIOReturnNotFound`).
 - Empty page tables are freed immediately (`Npt::prune`), so a VM with everything removed
   holds a single root page.
-- TLB: the guest's TLB entries (ASID 1) are flushed on every `VMRUN`, so no separate invalidations are needed after
-  `unmap`/`protect`. Since 0.7.18 that is `TLB_FLUSH_GUEST` (flush by ASID) where the CPU has FlushByAsid, so the host's own
-  entries survive the round trip; `FLUSH_ALL` otherwise. Tables may be changed only while the guest is not running: `VmRun` holds
-  the same lock.
+- TLB: since 0.7.22 each CPU hands out its own ASIDs and a vCPU keeps its ASID (and its TLB entries) while it stays on one CPU
+  (`kext/Source/VmcbCache.hpp`). Its ASID is flushed (`TLB_FLUSH_GUEST`, or `FLUSH_ALL` without FlushByAsid) when it gets a new
+  one, when `map`/`unmap`/`protect` changed the tables (a generation counter in the shared VM), when the kernel or the client wrote
+  CR0/CR3/CR4/EFER, the nested control, nCR3 or gPAT, and on `hv_vcpu_invalidate_tlb`. Up to 0.7.21 every `VMRUN` flushed the
+  guest's single ASID 1. Tables may be changed only while the guest is not running: `VmRun` holds the same lock.
+- VMCB clean bits (0.7.22): right after each exit the kernel copies every field a clean bit covers; before the next `VMRUN` a group
+  is marked clean only if its bytes still match and the vCPU is on the same CPU, so no writer of the VMCB has to remember to
+  mark it dirty.
 - `VmMap` accepts an address only from the process that opened the connection (`current_task() == owner`).
   Otherwise a process that was handed the connection port could pin other people's addresses.
 

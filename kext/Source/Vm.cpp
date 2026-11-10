@@ -6,6 +6,7 @@
 #include "Log.hpp"
 #include "SVM.hpp"
 #include "Vm.hpp"
+#include "VmcbCache.hpp"
 
 static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
 
@@ -33,6 +34,9 @@ namespace {
 const uint64_t kTimesliceNs = 10ull * 1000 * 1000;   /* return to userland at least every ~10 ms */
 
 const uint64_t kGuestPat = 0x0007040600070406ull;   /* power-on default PAT */
+
+/* Each CPU's guest ASIDs (VmcbCache.hpp). Only that CPU touches its pool, with interrupts off, right before VMRUN. */
+rhv::vmcb::AsidPool gAsidPool[RHV_MAX_CPUS];
 
 static_assert(RHV_GUEST_RAM_SIZE % 4096 == 0, "guest RAM must be page sized");
 static_assert((int)RHV_MEM_READ == (int)rhv::npt::PERM_R && (int)RHV_MEM_WRITE == (int)rhv::npt::PERM_W &&
@@ -212,6 +216,7 @@ void com_overlorddev_RyzenHVVmShared::free()
 bool com_overlorddev_RyzenHVVmShared::setup(uint32_t flags, task_t owner)
 {
     fOwner = owner;
+    fNptGen = 1;
     if (!fNpt.init(kNptAllocator))
         return false;
     if (!(flags & RHV_VMCREATE_NO_RAM)) {
@@ -379,6 +384,7 @@ IOReturn com_overlorddev_RyzenHVVmShared::map(task_t task, uint64_t uva, uint64_
     kickAll();
     IORWLockWrite(fRw);            /* no vCPU is inside the guest while the tables change */
     IOReturn rc = mapDescriptorLocked(md, gpa, size, perm);
+    fNptGen++;
     IORWLockUnlock(fRw);
 
     md->release();                 /* the backing took its own reference */
@@ -440,7 +446,8 @@ IOReturn com_overlorddev_RyzenHVVmShared::unmap(uint64_t gpa, uint64_t size)
             dropPage(static_cast<Backing *>(owner));
         }
     }
-    IORWLockUnlock(fRw);   /* the TLB is flushed on every VMRUN, see run() */
+    fNptGen++;
+    IORWLockUnlock(fRw);   /* every vCPU flushes its ASID on its next VMRUN, see run() */
 
     RHV_STAT_INC(vmUnmaps);
     return kIOReturnSuccess;
@@ -467,6 +474,7 @@ IOReturn com_overlorddev_RyzenHVVmShared::protect(uint64_t gpa, uint64_t size, u
             fNpt.protect(gpa + off, perm);
         RHV_STAT_INC(vmProtects);
     }
+    fNptGen++;
     IORWLockUnlock(fRw);
     return rc;
 }
@@ -566,6 +574,11 @@ bool com_overlorddev_RyzenHVVm::init()
     fHaveNextRip = false;
     bzero(fProf, sizeof(fProf));
     fFpuCheckCount = 0;
+    fSnap.forget();
+    fAsid.gen = 0; fAsid.asid = 0; fAsid.cpu = -1;
+    fSeenNptGen = 0;                 /* never equal to nptGen(): the first VMRUN flushes */
+    fSeenEpoch  = 0;
+    fTlbFlushPending = true;
     {
         /* Where each field runEx reports lives, worked out once instead of after every exit. */
         static const uint32_t kRun[RHV_RUN_NFIELDS] = {
@@ -834,6 +847,8 @@ void com_overlorddev_RyzenHVVm::profFlush()
     RHV_STAT_ADD(vmCycFeIn, fProf[kProfFeIn]);
     RHV_STAT_ADD(vmCycRunEx, fProf[kProfRunEx]);
     RHV_STAT_ADD(vmCycFeOut, fProf[kProfFeOut]);
+    RHV_STAT_ADD(vmTlbFlushes, fProf[kProfFlushes]);
+    RHV_STAT_ADD(vmAsidNew, fProf[kProfAsidNew]);
     bzero(fProf, sizeof(fProf));
 }
 
@@ -933,7 +948,6 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
 
         v->control.exitCode = 0;
-        v->control.clean    = 0;      /* every field is dirty, we never use clean bits yet */
 
         uint64_t hostCr2;
         __asm__ volatile("movq %%cr2, %0" : "=r"(hostCr2));   /* guest page faults can overwrite it */
@@ -997,11 +1011,43 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             break;
         }
         /*
-         * Every entry flushes the guest's TLB entries (all vCPUs of all VMs share ASID 1, and a vCPU moves between CPUs). Up to 0.7.17
-         * this was TLB_FLUSH_ALL, which also flushes the host's entries (ASID 0, global pages too): after every exit the macOS kernel and
-         * the client refilled their TLB. Flushing ASID 1 alone gives the guest exactly the same guarantee.
+         * ASID and clean bits (VmcbCache.hpp). Up to 0.7.21 all vCPUs shared ASID 1 and every entry flushed it, so the guest refilled
+         * its TLB after each exit. Now a vCPU keeps its ASID on this CPU and flushes it only when the translations behind it changed.
+         * Interrupts are off: this CPU's pool is ours alone.
          */
-        v->control.tlbCtl = svm::flushByAsid(runCpu) ? TLB_FLUSH_GUEST : TLB_FLUSH_ALL;
+        {
+            const uint32_t ep = svm::epoch();
+            if (ep != fSeenEpoch) {           /* SVM went off/on somewhere: nothing cached survives */
+                fSeenEpoch = ep;
+                fSnap.forget();
+                fAsid.cpu = -1;
+            }
+            const uint32_t nAsids = svm::numAsids(runCpu);
+            rhv::vmcb::AsidResult ar = rhv::vmcb::ASID_NEW_GENERATION;
+            if (nAsids >= 2) {
+                ar = rhv::vmcb::assignAsid(&gAsidPool[runCpu], nAsids, &fAsid, runCpu);
+                v->control.asid = fAsid.asid;
+            } else {
+                v->control.asid = 1;          /* cannot happen (VmCreate checked): the old behaviour, flush everything */
+                fAsid.cpu = -1;
+            }
+            const uint32_t dirty  = fSnap.dirty(v, runCpu);     /* after the ASID is in: it is a clean-bit field too */
+            const uint64_t nptGen = fShared->nptGen();
+            uint8_t tlb = TLB_DO_NOTHING;
+            if (ar == rhv::vmcb::ASID_NEW_GENERATION)
+                tlb = TLB_FLUSH_ALL;          /* this CPU hands its ASIDs out again: flush them all, once per wrap */
+            else if (ar == rhv::vmcb::ASID_NEW || fTlbFlushPending || nptGen != fSeenNptGen || (dirty & rhv::vmcb::CLEAN_FLUSH_GROUPS))
+                tlb = svm::flushByAsid(runCpu) ? TLB_FLUSH_GUEST : TLB_FLUSH_ALL;
+            if (tlb != TLB_DO_NOTHING) {
+                fTlbFlushPending = false;
+                fSeenNptGen = nptGen;
+                fProf[kProfFlushes]++;
+            }
+            if (ar != rhv::vmcb::ASID_KEPT)
+                fProf[kProfAsidNew]++;
+            v->control.tlbCtl = tlb;
+            v->control.clean  = (svmFix == 0 && svm::vmcbClean(runCpu)) ? (rhv::vmcb::CLEAN_KNOWN & ~dirty) : 0;
+        }
 
         /*
          * VMRUN does not touch x87/SSE/AVX state or XCR0. Swap them by hand, still with interrupts off, so
@@ -1065,6 +1111,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         rhv_svm_vmrun(&fGprs, fVmcb.pa, fHostVmcb.pa);
         const uint64_t tGuest1 = __builtin_ia32_rdtsc();
         fRunCpu = -1;
+        fSnap.take(v, runCpu);                /* before anything writes the VMCB again */
 
         if (fVmx && fHasTscAux) {
             const uint64_t g = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);

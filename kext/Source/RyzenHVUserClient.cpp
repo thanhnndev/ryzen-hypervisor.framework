@@ -291,7 +291,7 @@ IOReturn com_overlorddev_RyzenHVUserClient::sGetStats(OSObject *target, void *,
     /* The caller says which layout it was built with through its buffer size: this one or an older one (each is a prefix). Any other
      * size is refused rather than guessed at, and only that many bytes are copied (no fixed-size buffer in between). */
     const uint32_t size = args->structureOutputSize;
-    if (args->structureOutputDescriptor || !args->structureOutput || (size != RHV_STATS_SIZE && size != RHV_STATS_SIZE_V2 && size != RHV_STATS_SIZE_V1))
+    if (args->structureOutputDescriptor || !args->structureOutput || (size != RHV_STATS_SIZE && size != RHV_STATS_SIZE_V3 && size != RHV_STATS_SIZE_V2 && size != RHV_STATS_SIZE_V1))
         return kIOReturnBadArgument;
     me->fOwner->getStats(args->structureOutput, size);
     args->structureOutputSize = size;

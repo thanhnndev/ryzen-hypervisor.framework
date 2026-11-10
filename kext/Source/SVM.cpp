@@ -43,6 +43,7 @@ volatile SInt32           gRescanSeen;                /* CPUs a rescan's rendezv
 bool                      gWantEnabled;               /* enableAll() succeeded: CPUs that show up later get SVM too */
 uint32_t                  gNCpus;
 volatile SInt32           gActive;
+volatile SInt32           gEpoch;     /* changes whenever SVM was turned off or on anywhere: cached VMCB state and ASIDs are void */
 volatile SInt32           gHealed;    /* times ensureThisCpu() restored EFER.SVME or VM_HSAVE_PA */
 volatile SInt32           gSeen;      /* CPUs that ran probeAction */
 volatile SInt32           gMaxIndex;  /* highest cpu_number() seen */
@@ -373,6 +374,7 @@ void probe(RHVInfo *out, bool readMsrs)
 
 uint32_t enableAll()
 {
+    OSIncrementAtomic(&gEpoch);
     RHV_STAT_INC(enableCalls);
 
     if (gActive) {
@@ -408,6 +410,7 @@ uint32_t enableAll()
 
 void disableAll()
 {
+    OSIncrementAtomic(&gEpoch);
     RHV_STAT_INC(disableCalls);
 
     if (gActive) {
@@ -428,6 +431,7 @@ void disableAll()
 
 void suspend()
 {
+    OSIncrementAtomic(&gEpoch);
     if (!gActive)
         return;
 
@@ -440,6 +444,7 @@ void suspend()
 
 uint32_t resume()
 {
+    OSIncrementAtomic(&gEpoch);
     if (!gSuspended)
         return 0;
 
@@ -619,12 +624,28 @@ int ensureThisCpu()
     if (hsave != gHostSavePa[cpu])
         rhv_wrmsr(RHV_MSR_VM_HSAVE_PA, gHostSavePa[cpu]);
     OSIncrementAtomic(&gHealed);
+    OSIncrementAtomic(&gEpoch);
     return 1;
 }
 
 bool flushByAsid(int cpu)
 {
     return cpu >= 0 && cpu < RHV_MAX_CPUS && gSeenCpu[cpu] && ((gProbe[cpu].features >> 6) & 1);
+}
+
+bool vmcbClean(int cpu)
+{
+    return cpu >= 0 && cpu < RHV_MAX_CPUS && gSeenCpu[cpu] && ((gProbe[cpu].features >> 5) & 1);
+}
+
+uint32_t numAsids(int cpu)
+{
+    return cpu >= 0 && cpu < RHV_MAX_CPUS && gSeenCpu[cpu] ? gProbe[cpu].numAsids : 0;
+}
+
+uint32_t epoch()
+{
+    return (uint32_t)gEpoch;
 }
 
 uint32_t healedCount()
@@ -644,6 +665,7 @@ uint32_t usableCpuCount()
 
 uint32_t rescan()
 {
+    OSIncrementAtomic(&gEpoch);
     if (!gRescanLock)
         return 0;
 
@@ -691,6 +713,7 @@ uint32_t rescan()
 
 bool debugLimit(uint32_t n)
 {
+    OSIncrementAtomic(&gEpoch);
     if (!gRescanLock || n < 1 || n > RHV_MAX_CPUS)
         return false;
 

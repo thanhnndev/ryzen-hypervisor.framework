@@ -84,6 +84,18 @@ uint32_t healedCount();
 /* This CPU can flush one ASID's TLB entries on VMRUN (CPUID 0x8000000A EDX bit 6), so a guest flush leaves the host's entries alone. */
 bool flushByAsid(int cpu);
 
+/* This CPU honours VMCB clean bits (CPUID 0x8000000A EDX bit 5). */
+bool vmcbClean(int cpu);
+
+/* ASIDs this CPU offers (CPUID 0x8000000A EBX); 0 is the host's, guests use 1 .. numAsids-1. */
+uint32_t numAsids(int cpu);
+
+/*
+ * Changes whenever SVM was turned off or on anywhere (enable, disable, sleep, wake, rescan, a CPU whose EFER.SVME had to be
+ * restored). A vCPU that sees it change forgets its cached VMCB state and its ASID: VmcbCache.hpp.
+ */
+uint32_t epoch();
+
 /*
  * The CPUs are counted once, when the kext starts. On macOS 26 the other cores are not online yet at that moment (a Ryzen 9 5900X showed "cpus=1"), so
  * SVM was turned on for CPU 0 only and a VM thread on any other CPU stopped with "SVM cannot be used on cpu N". rescan() asks every CPU that is online now,

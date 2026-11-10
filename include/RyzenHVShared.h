@@ -261,6 +261,9 @@ typedef struct RHVStats {
     uint64_t vmCycFeIn;          /* front end before runEx: the client's dirty slots, MSRs, FP state into the core */
     uint64_t vmCycRunEx;         /* runEx: registers in, run(), registers and the 55 exit fields out */
     uint64_t vmCycFeOut;         /* front end after runEx: FP state, managed MSRs, slots into the page */
+    /* Since 0.7.22: per-vCPU ASIDs (counted in the same batches as the sums above, so per vmProfExits). */
+    uint64_t vmTlbFlushes;       /* VMRUNs that flushed the guest TLB (ASID moved, page tables or paging state changed) */
+    uint64_t vmAsidNew;          /* VMRUNs that gave the vCPU a new ASID (it moved to another CPU, or its first run) */
 } RHVStats;
 
 /* Guest registers as seen by userland (VmGetRegs / VmSetRegs). */
@@ -387,7 +390,8 @@ typedef struct RHVLogChunk {
 /* Compile-time size checks that work in both C and C++. */
 typedef char rhv_assert_log_chunk_size[(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE) ? 1 : -1];
 /* RHVStats size. The stats call accepts exactly this size or an older one (V2, V1) and copies only what the caller asked for. */
-#define RHV_STATS_SIZE    (35 * 8)
+#define RHV_STATS_SIZE    (37 * 8)
+#define RHV_STATS_SIZE_V3 (35 * 8)   /* 0.7.21 */
 #define RHV_STATS_SIZE_V2 (32 * 8)   /* 0.7.18-0.7.20 */
 #define RHV_STATS_SIZE_V1 (25 * 8)   /* before 0.7.18 */
 typedef char rhv_assert_stats_size[(sizeof(RHVStats) == RHV_STATS_SIZE) ? 1 : -1];

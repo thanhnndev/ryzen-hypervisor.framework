@@ -650,7 +650,11 @@ kern_return_t tCapWrite(void *target, uint64_t slot)
 kern_return_t tInvalidateTlb(void *target, uint64_t arg)
 {
     note(HV_THREAD_TRAP, 2, arg);
-    return target ? kHvOk : kHvNoDev;
+    HvVcpu *v = static_cast<HvVcpu *>(target);
+    if (!v)
+        return kHvNoDev;
+    v->cpu->requestTlbFlush();          /* the vCPU keeps its ASID across exits now: the next VMRUN flushes it */
+    return kHvOk;
 }
 
 /* Managed MSRs (thread traps 3 enable, 4 disable, 10 set access): the guest uses the MSR natively; the client reads its value from the

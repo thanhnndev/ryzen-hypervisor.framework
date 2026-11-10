@@ -26,6 +26,7 @@
 #include "FpuState.hpp"
 #include "Npt.hpp"
 #include "VmcsState.hpp"
+#include "VmcbCache.hpp"
 #include "PhysMem.hpp"
 #include "VMCB.hpp"
 
@@ -57,6 +58,8 @@ public:
     uint64_t            id() const { return fId; }
     rhv::npt::Table    &npt() { return fNpt; }
     IORWLock           *rw() const { return fRw; }
+    /* Goes up whenever the nested page tables change (under the write lock): a vCPU that sees it move flushes its ASID. */
+    uint64_t            nptGen() const { return fNptGen; }
     IOMemoryDescriptor *ramDescriptor() const { return fRam; }
     uint32_t            ramSize() const { return fRam ? RHV_GUEST_RAM_SIZE : 0; }
 
@@ -92,6 +95,7 @@ private:
     IOBufferMemoryDescriptor *fRam;
     rhv::npt::Table           fNpt;
     uint64_t                  fPagesMapped;
+    volatile uint64_t         fNptGen;
 };
 
 class com_overlorddev_RyzenHVVm : public OSObject {
@@ -150,6 +154,9 @@ public:
     IOReturn setFpu(const RHVFpuState *in);
 
     /* The front end's hv_vcpu_run trap took `cycles` TSC cycles (profiling, see RHVStats.vmCycTrap). Same thread as run(). */
+    /* hv_vcpu_invalidate_tlb: the next VMRUN flushes this vCPU's ASID. Same thread as run(). */
+    void     requestTlbFlush() { fTlbFlushPending = true; }
+
     void     profTrap(uint64_t cycles, uint64_t feIn, uint64_t runEx)
     {
         fProf[kProfTrap] += cycles;
@@ -185,11 +192,18 @@ private:
     bool                      fHaveNextRip;
 
     /* Profiling sums of this vCPU, added to rhv::gStats every kProfFlush exits (one atomic per field, not per exit). */
-    enum { kProfTrap, kProfTraps, kProfRun, kProfPre, kProfGuest, kProfPost, kProfExits, kProfFeIn, kProfRunEx, kProfFeOut, kProfCount };
+    enum { kProfTrap, kProfTraps, kProfRun, kProfPre, kProfGuest, kProfPost, kProfExits, kProfFeIn, kProfRunEx, kProfFeOut, kProfFlushes, kProfAsidNew, kProfCount };
     static const uint32_t     kProfFlush = 1024;
     uint64_t                  fProf[kProfCount];
     uint32_t                  fFpuCheckCount;    /* the host FPU self-check runs on one VMRUN in 64 */
     rhv::vmx::VmcsState::ReadPlan fRunPlan[RHV_RUN_NFIELDS];   /* the fields runEx reports, located once */
+
+    /* What the next VMRUN may skip, see VmcbCache.hpp. */
+    rhv::vmcb::Snapshot       fSnap;             /* the clean-bit fields at the last exit */
+    rhv::vmcb::AsidSlot       fAsid;
+    uint64_t                  fSeenNptGen;       /* fShared->nptGen() when this vCPU's ASID was last flushed */
+    uint32_t                  fSeenEpoch;        /* svm::epoch() at the last VMRUN */
+    bool                      fTlbFlushPending;
     void                      profFlush();
 };
 

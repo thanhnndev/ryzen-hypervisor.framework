@@ -110,7 +110,8 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
   IPIs a second, and in xAPIC mode each costs several exits to HyperKit (APIC accesses are nested page faults), ~50k exits/s for 24 vCPUs.
   What one exit costs: `env DYLD_INSERT_LIBRARIES=$PWD/build/libryzenhv.dylib build/hvf-exit-bench`. Where the time goes in the kext
   (0.7.18 and later): `rhv-info stats`, lines "per trap" and "per VMRUN". Since 0.7.18 a VMRUN flushes only the guest's TLB entries
-  (before, the host's TLB was flushed on every exit too) and skips debug-register and TSC_AUX writes that change nothing.
+  (before, the host's TLB was flushed on every exit too) and skips debug-register and TSC_AUX writes that change nothing. Since 0.7.22
+  a vCPU keeps its own ASID across exits and VMRUN uses VMCB clean bits; `rhv-info stats` line "guest TLB" shows how often it still flushes.
 
 ### For every VM
 
