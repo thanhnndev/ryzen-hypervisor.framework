@@ -37,6 +37,7 @@ const uint64_t kGpaLimit = 1ull << 48;   /* 4-level walk */
 const uint64_t E_P         = 1ull << 0;
 const uint64_t E_RW        = 1ull << 1;
 const uint64_t E_US        = 1ull << 2;
+const uint64_t E_A         = 1ull << 5;    /* accessed: the CPU sets it when a nested walk uses the entry */
 const uint64_t E_NX        = 1ull << 63;
 const uint64_t E_ADDR_MASK = 0x000FFFFFFFFFF000ull;
 
@@ -253,6 +254,37 @@ public:
     }
 
     bool isMapped(uint64_t gpa) const { return lookup(gpa, nullptr, nullptr) != nullptr; }
+
+    /*
+     * For reclaiming cold guest RAM (kext Vm.cpp). [gpa, gpa+size) must lie inside one 2 MiB-aligned block, which is exactly one leaf
+     * table. Returns how many of its pages are mapped and sets *accessed when any of their leaves has A set; with `clear` those A bits
+     * are cleared. The clear is an atomic AND because the CPU may set A or D in the same entry at the same moment. The caller holds off
+     * structural changes (map/unmap), but vCPUs may run: the tree is only read.
+     */
+    unsigned scanAccessed(uint64_t gpa, uint64_t size, bool clear, bool *accessed)
+    {
+        *accessed = false;
+        if ((gpa & 0xFFF) || (size & 0xFFF) || size == 0 || ((gpa ^ (gpa + size - 1)) >> 21))
+            return 0;
+        Node *path[4];
+        unsigned idx[4];
+        Node *leaf = walk(gpa, path, idx);
+        if (!leaf)
+            return 0;
+        unsigned mapped = 0;
+        const unsigned end = idx[3] + (unsigned)(size >> 12);
+        for (unsigned i = idx[3]; i < end; i++) {
+            if (!leaf->slot[i])
+                continue;
+            mapped++;
+            if (__atomic_load_n(&leaf->table[i], __ATOMIC_RELAXED) & E_A) {
+                *accessed = true;
+                if (clear)
+                    __atomic_fetch_and(&leaf->table[i], ~E_A, __ATOMIC_RELAXED);
+            }
+        }
+        return mapped;
+    }
 
     /*
      * Drops everything. `release` is called once per still-mapped page with its

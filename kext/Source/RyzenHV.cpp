@@ -6,6 +6,7 @@
 #include "Log.hpp"
 #include "RyzenHV.hpp"
 #include "SVM.hpp"
+#include "Vm.hpp"
 
 #define super IOService
 
@@ -150,6 +151,7 @@ void com_overlorddev_RyzenHV::stop(IOService *provider)
 {
     RHV_INFO("stopping");
     rhv::hv::stop();
+    rhv::reclaim::stop();          /* before the VMs and SVM go: no scan may run after this */
     if (fPMNotifier) {
         fPMNotifier->remove();
         fPMNotifier = nullptr;

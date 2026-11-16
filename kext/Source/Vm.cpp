@@ -1,5 +1,7 @@
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 
 #include "KernelDecls.hpp"
 #include "MsrMap.hpp"
@@ -218,6 +220,9 @@ void com_overlorddev_RyzenHVVmShared::free()
     }
     /* Unpins every buffer that is still mapped, then returns the tables. */
     fNpt.shutdown(&releaseOwner, this);
+    for (uint32_t i = 0; i < fNLazy; i++)
+        freeChunks(fLazy[i]);
+    fNLazy = 0;
     if (fRam) {
         fRam->release();
         fRam = nullptr;
@@ -607,6 +612,9 @@ IOReturn com_overlorddev_RyzenHVVmShared::mapLazy(task_t task, uint64_t uva, uin
         RHV_STAT_INC(vmMapFailures);
         return rc;
     }
+    const uint64_t chunkBase = gpa >> 21;
+    const uint32_t nChunks   = (uint32_t)(((gpa + size - 1) >> 21) - chunkBase + 1);
+    uint8_t *chunks = allocChunks(nChunks);     /* nullptr only costs reclaim for this range */
 
     kickAll();
     IORWLockWrite(fRw);
@@ -625,15 +633,21 @@ IOReturn com_overlorddev_RyzenHVVmShared::mapLazy(task_t task, uint64_t uva, uin
         r.uva  = uva;
         r.perm = perm;
         r.task = task;
+        r.chunk     = chunks;
+        r.chunkBase = chunkBase;
+        r.nChunks   = chunks ? nChunks : 0;
+        chunks = nullptr;
         rc = mapDescriptorLocked(md, gpa, firstEnd - gpa, perm, true);   /* takes over the wiring, also on failure */
         if (rc != kIOReturnSuccess)
-            fNLazy--;
+            freeChunks(fLazy[--fNLazy]);
     } else {
         md->complete(kIODirectionInOut);
     }
     fNptGen++;
     IORWLockUnlock(fRw);
     md->release();
+    if (chunks)
+        IOFree(chunks, nChunks);
 
     if (rc == kIOReturnSuccess) {
         RHV_STAT_INC(vmMaps);
@@ -649,6 +663,7 @@ IOReturn com_overlorddev_RyzenHVVmShared::mapLazy(task_t task, uint64_t uva, uin
 
 IOReturn com_overlorddev_RyzenHVVmShared::faultIn(task_t task, uint64_t gpa)
 {
+    const uint64_t t0 = __builtin_ia32_rdtsc();
     const uint64_t page = gpa & ~(uint64_t)0xFFF;
     LazyRange r = {};
     bool have = false;
@@ -692,7 +707,19 @@ IOReturn com_overlorddev_RyzenHVVmShared::faultIn(task_t task, uint64_t gpa)
         md->complete(kIODirectionInOut);   /* unmapped or carved while we wired: nothing to do, the guest runs again */
         rc = kIOReturnSuccess;
     } else {
-        rc = mapLazyChunkLocked(fLazy[i], cs, ce, md);
+        LazyRange &lr = fLazy[i];
+        rc = mapLazyChunkLocked(lr, cs, ce, md);
+        if (rc == kIOReturnSuccess) {
+            RHV_STAT_INC(vmLazyFaults);
+            const uint64_t ci = (cs >> 21) - lr.chunkBase;
+            if (lr.chunk && ci < lr.nChunks) {
+                if (lr.chunk[ci] & kChunkEvicted) {
+                    RHV_STAT_INC(vmLazyRefaults);
+                    RHV_STAT_ADD(vmLazyRefaultCyc, __builtin_ia32_rdtsc() - t0);
+                }
+                lr.chunk[ci] = 0;
+            }
+        }
     }
     IORWLockUnlock(fRw);
     md->release();
@@ -738,6 +765,7 @@ void com_overlorddev_RyzenHVVmShared::forgetLazyLocked(uint64_t gpa, uint64_t si
         if (y <= a || b <= x)
             continue;
         if (x <= a && y >= b) {                    /* all of it */
+            freeChunks(r);
             fLazy[i] = fLazy[--fNLazy];
             i--;
         } else if (x <= a) {                       /* the head */
@@ -752,6 +780,22 @@ void com_overlorddev_RyzenHVVmShared::forgetLazyLocked(uint64_t gpa, uint64_t si
             t.gpa  = y;
             t.size = b - y;
             r.size = x - a;
+            /* The tail gets its own copy of the chunk states (each range frees its own array). */
+            t.chunk = nullptr;
+            t.nChunks = 0;
+            if (r.chunk) {
+                t.chunkBase = y >> 21;
+                const uint64_t last = (b - 1) >> 21;
+                const uint32_t n = (uint32_t)(last - t.chunkBase + 1);
+                t.chunk = allocChunks(n);
+                if (t.chunk) {
+                    t.nChunks = n;
+                    for (uint32_t k = 0; k < n; k++) {
+                        const uint64_t src = t.chunkBase + k - r.chunkBase;
+                        t.chunk[k] = src < r.nChunks ? r.chunk[src] : 0;
+                    }
+                }
+            }
             fLazy[fNLazy++] = t;
         } else {                                   /* the middle, no free slot: the tail becomes eager */
             const LazyRange keep = r;
@@ -763,6 +807,222 @@ void com_overlorddev_RyzenHVVmShared::forgetLazyLocked(uint64_t gpa, uint64_t si
         }
     }
 }
+
+uint8_t *com_overlorddev_RyzenHVVmShared::allocChunks(uint32_t n)
+{
+    if (n == 0)
+        return nullptr;
+    uint8_t *p = (uint8_t *)IOMalloc(n);
+    if (p)
+        bzero(p, n);
+    return p;
+}
+
+void com_overlorddev_RyzenHVVmShared::freeChunks(LazyRange &r)
+{
+    if (r.chunk)
+        IOFree(r.chunk, r.nChunks);
+    r.chunk   = nullptr;
+    r.nChunks = 0;
+}
+
+/*
+ * One reclaim round. Phase 1 holds the page tables for reading (vCPUs keep running, map/unmap/faultIn wait): every mapped chunk's
+ * accessed bits are read and cleared, and one nptGen bump makes each vCPU flush its ASID at its next entry, so a later access sets A
+ * again. Phase 2, only when some chunk has been cold for `coldScans` rounds: kick, take the write lock, unmap those chunks (the last
+ * page of a chunk's Backing unwires it) and bump nptGen once for the batch.
+ */
+void com_overlorddev_RyzenHVVmShared::reclaimScan(uint32_t coldScans, uint32_t maxEvict)
+{
+    if (fNLazy == 0)
+        return;
+    uint64_t *victims = maxEvict ? (uint64_t *)IOMalloc(maxEvict * sizeof(uint64_t)) : nullptr;
+    uint32_t nv = 0;
+    uint64_t scanned = 0;
+
+    IORWLockRead(fRw);
+    for (uint32_t i = 0; i < fNLazy; i++) {
+        LazyRange &r = fLazy[i];
+        if (!r.chunk)
+            continue;
+        const uint64_t end = r.gpa + r.size;
+        for (uint64_t c = r.gpa >> 21; c <= (end - 1) >> 21; c++) {
+            const uint64_t lo = (c << 21) > r.gpa ? (c << 21) : r.gpa;
+            const uint64_t hi = ((c + 1) << 21) < end ? ((c + 1) << 21) : end;
+            bool acc = false;
+            if (fNpt.scanAccessed(lo, hi - lo, true, &acc) == 0)
+                continue;                        /* not resident: nothing to age */
+            scanned++;
+            const uint64_t ci = c - r.chunkBase;
+            if (ci >= r.nChunks)
+                continue;
+            uint8_t &st = r.chunk[ci];
+            if (acc)
+                st = 0;
+            else if ((st & kChunkColdMask) < kChunkColdMask)
+                st++;
+            if ((st & kChunkColdMask) >= coldScans && victims && nv < maxEvict)
+                victims[nv++] = c;
+        }
+    }
+    if (scanned)
+        __atomic_add_fetch(&fNptGen, 1, __ATOMIC_SEQ_CST);   /* readers only besides us: the write-lock users are shut out */
+    IORWLockUnlock(fRw);
+    RHV_STAT_INC(vmReclaimScans);
+    RHV_STAT_ADD(vmReclaimScanned, scanned);
+
+    if (nv) {
+        uint64_t evicted = 0;
+        kickAll();
+        IORWLockWrite(fRw);
+        for (uint32_t k = 0; k < nv; k++) {
+            const uint64_t c = victims[k];
+            int i = -1;
+            for (uint32_t j = 0; j < fNLazy && i < 0; j++) {     /* the range may have been trimmed or split meanwhile */
+                const uint64_t lo = (c << 21) > fLazy[j].gpa ? (c << 21) : fLazy[j].gpa;
+                if (lo < fLazy[j].gpa + fLazy[j].size && lo >= fLazy[j].gpa && (lo >> 21) == c)
+                    i = (int)j;
+            }
+            if (i < 0)
+                continue;
+            LazyRange &r = fLazy[i];
+            const uint64_t ci = c - r.chunkBase;
+            if (!r.chunk || ci >= r.nChunks || (r.chunk[ci] & kChunkColdMask) < coldScans)
+                continue;
+            const uint64_t end = r.gpa + r.size;
+            const uint64_t lo = (c << 21) > r.gpa ? (c << 21) : r.gpa;
+            const uint64_t hi = ((c + 1) << 21) < end ? ((c + 1) << 21) : end;
+            bool any = false;
+            for (uint64_t g = lo; g < hi; g += 4096) {
+                void *owner = fNpt.unmap(g);
+                if (owner) {
+                    any = true;
+                    fPagesMapped--;
+                    RHV_STAT_ADD(vmPagesMapped, -1);
+                    dropPage(static_cast<Backing *>(owner));
+                }
+            }
+            r.chunk[ci] = kChunkEvicted;
+            if (any)
+                evicted++;
+        }
+        fNptGen++;
+        IORWLockUnlock(fRw);
+        RHV_STAT_ADD(vmReclaimEvicted, evicted);
+    }
+    if (victims)
+        IOFree(victims, maxEvict * sizeof(uint64_t));
+}
+
+void com_overlorddev_RyzenHVVmShared::reclaimAll(uint32_t coldScans, uint32_t maxEvict)
+{
+    IOLock *reg = sharedLock();
+    if (!reg)
+        return;
+    /* Held for the whole round: free() unlinks under this lock before it tears anything down, so no VM can go away under us. Lock
+     * order registry -> page tables / vCPU list; nothing takes the registry while holding those. */
+    IOLockLock(reg);
+    for (unsigned i = 0; i < sizeof(gShared) / sizeof(gShared[0]); i++)
+        if (gShared[i])
+            gShared[i]->reclaimScan(coldScans, maxEvict);
+    IOLockUnlock(reg);
+}
+
+namespace rhv {
+namespace reclaim {
+namespace {
+volatile uint32_t gOn       = 0;
+volatile uint32_t gPeriodMs = 10000;
+volatile uint32_t gCold     = 6;
+volatile uint32_t gBatchMiB = 256;
+volatile uint32_t gStopping = 0;
+thread_call_t     gCall     = nullptr;
+
+void arm()
+{
+    if (gCall && gOn && !gStopping) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(gPeriodMs, kMillisecondScale, &deadline);
+        thread_call_enter_delayed(gCall, deadline);
+    }
+}
+
+void tick(thread_call_param_t, thread_call_param_t)
+{
+    if (!gOn || gStopping)
+        return;
+    uint32_t batch = gBatchMiB / 2;          /* 2 MiB chunks */
+    if (batch == 0)
+        batch = 1;
+    com_overlorddev_RyzenHVVmShared::reclaimAll(gCold, batch);
+    arm();
+}
+} // namespace
+
+bool enabled() { return gOn != 0; }
+
+bool set(uint32_t cmd, uint64_t value)
+{
+    switch (cmd) {
+    case kRHVHvReclaim:
+        if (value > 1)
+            return false;
+        if (value && !gCall) {
+            thread_call_t c = thread_call_allocate_with_options(&tick, nullptr, THREAD_CALL_PRIORITY_LOW, THREAD_CALL_OPTIONS_ONCE);
+            if (!c)
+                return false;
+            if (!OSCompareAndSwapPtr(nullptr, c, (void *volatile *)&gCall))
+                thread_call_free(c);
+        }
+        gOn = (uint32_t)value;
+        if (gOn)
+            arm();
+        RHV_INFO("reclaim of cold guest RAM: %s (every %u ms, cold after %u scans, at most %u MiB per scan)", gOn ? "on" : "off",
+                 gPeriodMs, gCold, gBatchMiB);
+        return true;
+    case kRHVHvReclaimPeriod:
+        if (value < 1000 || value > 600000)
+            return false;
+        gPeriodMs = (uint32_t)value;
+        return true;
+    case kRHVHvReclaimCold:
+        if (value < 1 || value > 63)
+            return false;
+        gCold = (uint32_t)value;
+        return true;
+    case kRHVHvReclaimBatch:
+        if (value < 2 || value > 16384)
+            return false;
+        gBatchMiB = (uint32_t)value;
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint64_t get(uint32_t cmd)
+{
+    switch (cmd) {
+    case kRHVHvReclaim:       return gOn;
+    case kRHVHvReclaimPeriod: return gPeriodMs;
+    case kRHVHvReclaimCold:   return gCold;
+    case kRHVHvReclaimBatch:  return gBatchMiB;
+    default:                  return 0;
+    }
+}
+
+void stop()
+{
+    gStopping = 1;
+    gOn = 0;
+    thread_call_t c = gCall;
+    if (c && OSCompareAndSwapPtr(c, nullptr, (void *volatile *)&gCall)) {
+        thread_call_cancel_wait(c);
+        thread_call_free(c);
+    }
+}
+} // namespace reclaim
+} // namespace rhv
 
 /* ---- one vCPU ---- */
 

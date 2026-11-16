@@ -38,6 +38,18 @@ struct GuestGprs {
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
 };
 
+/*
+ * Reclaim of cold lazy guest RAM (0.7.23, off by default). One thread call scans every VM's lazy chunks each period: it clears
+ * the NPT accessed bits, and a chunk that stays unaccessed for `cold` scans is unmapped and unwired (the guest's next touch wires it
+ * again through faultIn). Unwired pages stay resident until the host needs the memory. Set at run time through kRHVHvReclaim*.
+ */
+namespace reclaim {
+bool     set(uint32_t cmd, uint64_t value);     /* kRHVHvReclaim*; false: bad value */
+uint64_t get(uint32_t cmd);
+bool     enabled();
+void     stop();                                /* kext stop: cancels and frees the thread call */
+} // namespace reclaim
+
 } // namespace rhv
 
 
@@ -84,6 +96,11 @@ public:
     bool     lazyCandidate(uint64_t gpa) const;
     IOReturn faultIn(task_t task, uint64_t gpa);
 
+    /* One reclaim round over this VM (rhv::reclaim). Thread context, no lock held; the caller keeps the VM alive. */
+    void     reclaimScan(uint32_t coldScans, uint32_t maxEvict);
+    /* Every VM in the registry, with the registry lock held so none can be freed meanwhile. */
+    static void reclaimAll(uint32_t coldScans, uint32_t maxEvict);
+
     /* The vCPUs, for kicking them out of the guest. attach() fails with kIOReturnNoResources when the VM is full. */
     IOReturn attach(com_overlorddev_RyzenHVVm *vcpu, uint32_t *index);
     void     detach(com_overlorddev_RyzenHVVm *vcpu);
@@ -103,7 +120,13 @@ private:
         uint64_t gpa, size, uva;
         uint32_t perm;
         task_t   task;       /* compared only: the range dies with the client's VM */
+        uint8_t *chunk;      /* per 2 MiB chunk: bits 0-5 scans without access, bit 7 unwired by reclaim; nullptr: no reclaim */
+        uint64_t chunkBase;  /* gpa >> 21 of chunk[0]; stays put when the range is trimmed */
+        uint32_t nChunks;    /* entries in chunk[] */
     };
+    enum : uint8_t { kChunkColdMask = 0x3F, kChunkEvicted = 0x80 };
+    static uint8_t *allocChunks(uint32_t n);
+    static void     freeChunks(LazyRange &r);
     enum { kMaxLazy = 16 };
     int      lazyIndex(uint64_t gpa) const;                          /* -1 when none; rw() held */
     void     forgetLazyLocked(uint64_t gpa, uint64_t size);          /* unmap: cut [gpa, gpa+size) out of the lazy ranges */

@@ -141,8 +141,17 @@ enum {
     kRHVHvSvmRescan = 5, /* debugging: look for CPUs that came online late and turn SVM on there; state[1] is how many were enabled */
     kRHVHvDebug     = 6, /* debugging, value = flags: bit 0 records the last 512 exits of every client's vCPUs (off by default), bit 1 freezes the recording when a vCPU stays in one page of kernel code with interrupts off for 24 timeslice exits */
     kRHVHvFlightDump = 7, /* debugging, value N: writes N recorded exits to the kernel log (`rhv-info log`); value = N | (SKIP << 16): the newest SKIP exits are left out */
-    kRHVHvReadGuest  = 8  /* debugging, value = a 64-bit guest virtual address: walks the guest's page tables (CR3 of the last recorded exit) and logs 256 bytes there */
+    kRHVHvReadGuest  = 8, /* debugging, value = a 64-bit guest virtual address: walks the guest's page tables (CR3 of the last recorded exit) and logs 256 bytes there */
+    /*
+     * Since 0.7.23: reclaim of cold lazy guest RAM (kext/Source/Vm.cpp). value = kRHVHvGetValue only reads. Output: state[0] = the value
+     * now, state[1] = 1 when reclaim is on. Takes effect at the next scan; nothing needs a reboot or a VM restart.
+     */
+    kRHVHvReclaim       = 9,  /* 0/1: off (default) / on */
+    kRHVHvReclaimPeriod = 10, /* ms between scans, 1000..600000 (default 10000) */
+    kRHVHvReclaimCold   = 11, /* scans without a guest access before a chunk is unwired, 1..63 (default 6) */
+    kRHVHvReclaimBatch  = 12  /* MiB unwired at most per scan per VM, 2..16384 (default 256) */
 };
+#define kRHVHvGetValue (~0ull)
 /* state bits returned in scalarOutput[0] */
 enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1, kRHVHvStateTpr = 1u << 2 };
 
@@ -264,6 +273,13 @@ typedef struct RHVStats {
     /* Since 0.7.22: per-vCPU ASIDs (counted in the same batches as the sums above, so per vmProfExits). */
     uint64_t vmTlbFlushes;       /* VMRUNs that flushed the guest TLB (ASID moved, page tables or paging state changed) */
     uint64_t vmAsidNew;          /* VMRUNs that gave the vCPU a new ASID (it moved to another CPU, or its first run) */
+    /* Since 0.7.23: lazy guest RAM and its reclaim (2 MiB chunks). */
+    uint64_t vmLazyFaults;       /* chunks wired and mapped on a guest touch (first touches and re-faults) */
+    uint64_t vmLazyRefaults;     /* of those, chunks that reclaim had unwired before */
+    uint64_t vmLazyRefaultCyc;   /* TSC cycles spent in those re-faults (wire + map), summed */
+    uint64_t vmReclaimScans;     /* scan rounds (per VM) */
+    uint64_t vmReclaimScanned;   /* mapped chunks looked at */
+    uint64_t vmReclaimEvicted;   /* chunks unwired and unmapped because they were cold */
 } RHVStats;
 
 /* Guest registers as seen by userland (VmGetRegs / VmSetRegs). */
@@ -390,7 +406,8 @@ typedef struct RHVLogChunk {
 /* Compile-time size checks that work in both C and C++. */
 typedef char rhv_assert_log_chunk_size[(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE) ? 1 : -1];
 /* RHVStats size. The stats call accepts exactly this size or an older one (V2, V1) and copies only what the caller asked for. */
-#define RHV_STATS_SIZE    (37 * 8)
+#define RHV_STATS_SIZE    (43 * 8)
+#define RHV_STATS_SIZE_V4 (37 * 8)   /* 0.7.22 */
 #define RHV_STATS_SIZE_V3 (35 * 8)   /* 0.7.21 */
 #define RHV_STATS_SIZE_V2 (32 * 8)   /* 0.7.18-0.7.20 */
 #define RHV_STATS_SIZE_V1 (25 * 8)   /* before 0.7.18 */
