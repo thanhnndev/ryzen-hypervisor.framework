@@ -1,4 +1,5 @@
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
 
 #include "KernelDecls.hpp"
 #include "MsrMap.hpp"
@@ -42,6 +43,25 @@ static_assert(RHV_GUEST_RAM_SIZE % 4096 == 0, "guest RAM must be page sized");
 static_assert((int)RHV_MEM_READ == (int)rhv::npt::PERM_R && (int)RHV_MEM_WRITE == (int)rhv::npt::PERM_W &&
                   (int)RHV_MEM_EXEC == (int)rhv::npt::PERM_X,
               "RHV_MEM_* must match the NPT permission bits");
+
+/*
+ * Lazy guest RAM (see Vm.hpp). A map of at least kLazyMinBytes is wired chunk by chunk on first touch. 2 MiB matches the
+ * guest's transparent huge pages and keeps the number of first-touch faults small (4096 for 8 GiB, once per chunk).
+ */
+const uint64_t kLazyMinBytes = 64ull << 20;
+const uint64_t kLazyChunk    = 2ull << 20;
+
+bool lazyMapEnabled()
+{
+    static volatile SInt32 state = -1;
+    if (state < 0) {
+        uint32_t v = 1;
+        if (!PE_parse_boot_argn("rhv_lazymap", &v, sizeof(v)))
+            v = 1;
+        state = v ? 1 : 0;
+    }
+    return state == 1;
+}
 
 /* Table pages are wired physically contiguous kernel pages. Node bookkeeping is plain kernel heap. */
 bool nptAllocPage(void *, rhv::npt::Page *out)
@@ -179,6 +199,8 @@ bool com_overlorddev_RyzenHVVmShared::init()
     bzero(fVcpus, sizeof(fVcpus));
     fRam = nullptr;
     fPagesMapped = 0;
+    bzero(fLazy, sizeof(fLazy));
+    fNLazy = 0;
     fRw = IORWLockAlloc();
     fRegLock = IOLockAlloc();
     return fRw && fRegLock;
@@ -309,20 +331,23 @@ static bool mdSegment(void *ctx, uint64_t offset, uint64_t *pa, uint64_t *len)
 
 /*
  * Maps [0, size) of `md` at guest physical `gpa`, page by page, all or nothing.
- * Wires `md` (prepare) and holds a reference on it until the last page is unmapped.
+ * Wires `md` (prepare) and holds a reference on it until the last page is unmapped. With `prepared` the caller already
+ * wired it (outside the lock) and hands that wiring over: it is undone here on failure, and by the last unmap otherwise.
  * Caller holds the lock or is still constructing the VM.
  */
 IOReturn com_overlorddev_RyzenHVVmShared::mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa,
-                                                        uint64_t size, uint32_t perm)
+                                                        uint64_t size, uint32_t perm, bool prepared)
 {
     for (uint64_t off = 0; off < size; off += 4096) {
         if (fNpt.isMapped(gpa + off)) {
             RHV_DBG("VM map: guest page 0x%llx is already mapped", (unsigned long long)(gpa + off));
+            if (prepared)
+                md->complete(kIODirectionInOut);
             return kIOReturnBusy;
         }
     }
 
-    IOReturn rc = md->prepare(kIODirectionInOut);
+    IOReturn rc = prepared ? kIOReturnSuccess : md->prepare(kIODirectionInOut);
     if (rc != kIOReturnSuccess) {
         RHV_WARN("VM map: cannot pin the buffer: 0x%x", rc);
         return rc;
@@ -376,6 +401,13 @@ IOReturn com_overlorddev_RyzenHVVmShared::map(task_t task, uint64_t uva, uint64_
         ((uva | gpa | size) & 0xFFF) || gpa >= rhv::npt::kGpaLimit ||
         size > rhv::npt::kGpaLimit - gpa || uva + size < uva)
         return kIOReturnBadArgument;
+
+    if (lazyMapEnabled() && size >= kLazyMinBytes && (perm & rhv::npt::PERM_R)) {
+        IOReturn lrc = mapLazy(task, uva, gpa, size, perm);
+        if (lrc != kIOReturnUnsupported)
+            return lrc;
+        /* no free lazy slot: map it the old way */
+    }
 
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(uva, size, kIODirectionInOut, task);
     if (!md)
@@ -438,6 +470,7 @@ IOReturn com_overlorddev_RyzenHVVmShared::unmap(uint64_t gpa, uint64_t size)
 
     kickAll();
     IORWLockWrite(fRw);
+    forgetLazyLocked(gpa, size);   /* first: no vCPU can fault a chunk of it back in once the lock is released */
     for (uint64_t off = 0; off < size; off += 4096) {
         void *owner = fNpt.unmap(gpa + off);
         if (owner) {
@@ -462,8 +495,10 @@ IOReturn com_overlorddev_RyzenHVVmShared::protect(uint64_t gpa, uint64_t size, u
 
     kickAll();
     IORWLockWrite(fRw);
-    IOReturn rc = kIOReturnSuccess;
-    for (uint64_t off = 0; off < size; off += 4096) {
+    /* A lazy range has no NPT entries yet where the guest has not been: map those first, so protect sees what an eager map would
+     * have left (rare: HyperKit never calls protect; it wires under the write lock, which a protect holds anyway). */
+    IOReturn rc = materializeLocked(gpa, size);
+    for (uint64_t off = 0; rc == kIOReturnSuccess && off < size; off += 4096) {
         if (!fNpt.isMapped(gpa + off)) {
             rc = kIOReturnNotFound;   /* check everything first so a failure changes nothing */
             break;
@@ -479,6 +514,255 @@ IOReturn com_overlorddev_RyzenHVVmShared::protect(uint64_t gpa, uint64_t size, u
     return rc;
 }
 
+
+/* ---- lazy guest RAM (Vm.hpp) ---- */
+
+namespace {
+struct SubSeg {
+    IOMemoryDescriptor *md;
+    uint64_t            base;    /* where the sub-range starts inside md */
+};
+
+bool subSegment(void *ctx, uint64_t offset, uint64_t *pa, uint64_t *len)
+{
+    const SubSeg *s = static_cast<const SubSeg *>(ctx);
+    return mdSegment(s->md, s->base + offset, pa, len);
+}
+} // namespace
+
+int com_overlorddev_RyzenHVVmShared::lazyIndex(uint64_t gpa) const
+{
+    for (uint32_t i = 0; i < fNLazy; i++)
+        if (gpa >= fLazy[i].gpa && gpa - fLazy[i].gpa < fLazy[i].size)
+            return (int)i;
+    return -1;
+}
+
+bool com_overlorddev_RyzenHVVmShared::lazyCandidate(uint64_t gpa) const
+{
+    if (fNLazy == 0)
+        return false;
+    const uint64_t page = gpa & ~(uint64_t)0xFFF;
+    return lazyIndex(page) >= 0 && !fNpt.isMapped(page);
+}
+
+/*
+ * Maps [cs, ce) of lazy range `r` from `md`, which the caller wired and hands over (the last unmap undoes the wiring). Normally
+ * nothing in the chunk is mapped yet; if a client map/unmap carved into it, only the pages that are not mapped are entered.
+ */
+IOReturn com_overlorddev_RyzenHVVmShared::mapLazyChunkLocked(const LazyRange &r, uint64_t cs, uint64_t ce,
+                                                             IOMemoryDescriptor *md)
+{
+    bool partial = false;
+    for (uint64_t g = cs; g < ce; g += 4096)
+        if (fNpt.isMapped(g)) {
+            partial = true;
+            break;
+        }
+    if (!partial)
+        return mapDescriptorLocked(md, cs, ce - cs, r.perm, true);
+
+    Backing *b = (Backing *)IOMalloc(sizeof(Backing));
+    if (!b) {
+        md->complete(kIODirectionInOut);
+        return kIOReturnNoMemory;
+    }
+    md->retain();
+    b->md   = md;
+    b->live = 1;
+    IOReturn rc = kIOReturnSuccess;
+    for (uint64_t g = cs; g < ce; g += 4096) {
+        if (fNpt.isMapped(g))
+            continue;
+        SubSeg ss = { md, g - cs };
+        uint64_t done = 0;
+        const rhv::npt::Status st = fNpt.mapRange(g, 4096, r.perm, b, &subSegment, &ss, &done);
+        if (done) {
+            b->live++;
+            fPagesMapped++;
+            RHV_STAT_ADD(vmPagesMapped, 1);
+        }
+        if (st != rhv::npt::OK) {
+            rc = st == rhv::npt::NO_MEMORY ? kIOReturnNoMemory : kIOReturnVMError;
+            break;            /* what is mapped stays mapped: it is valid, and the next fault retries the rest */
+        }
+    }
+    dropPage(b);
+    return rc;
+}
+
+/* An hv_vm_map of at least kLazyMinBytes: record it, wire and map only its first chunk (which also checks the client's range the
+ * way the eager path would: an unmapped or read-only range fails here, not at the guest's first touch). */
+IOReturn com_overlorddev_RyzenHVVmShared::mapLazy(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t perm)
+{
+    const uint64_t firstEnd0 = (gpa & ~(kLazyChunk - 1)) + kLazyChunk;
+    const uint64_t firstEnd  = firstEnd0 < gpa + size ? firstEnd0 : gpa + size;
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(uva, firstEnd - gpa, kIODirectionInOut, task);
+    if (!md)
+        return kIOReturnVMError;
+    IOReturn rc = md->prepare(kIODirectionInOut);
+    if (rc != kIOReturnSuccess) {
+        RHV_WARN("VM map (lazy): cannot pin the first chunk: 0x%x", rc);
+        md->release();
+        RHV_STAT_INC(vmMapFailures);
+        return rc;
+    }
+
+    kickAll();
+    IORWLockWrite(fRw);
+    for (uint64_t off = 0; rc == kIOReturnSuccess && off < size; off += 4096)
+        if (fNpt.isMapped(gpa + off))
+            rc = kIOReturnBusy;
+    for (uint32_t i = 0; rc == kIOReturnSuccess && i < fNLazy; i++)
+        if (gpa < fLazy[i].gpa + fLazy[i].size && fLazy[i].gpa < gpa + size)
+            rc = kIOReturnBusy;
+    if (rc == kIOReturnSuccess && fNLazy == kMaxLazy)
+        rc = kIOReturnUnsupported;
+    if (rc == kIOReturnSuccess) {
+        LazyRange &r = fLazy[fNLazy++];
+        r.gpa  = gpa;
+        r.size = size;
+        r.uva  = uva;
+        r.perm = perm;
+        r.task = task;
+        rc = mapDescriptorLocked(md, gpa, firstEnd - gpa, perm, true);   /* takes over the wiring, also on failure */
+        if (rc != kIOReturnSuccess)
+            fNLazy--;
+    } else {
+        md->complete(kIODirectionInOut);
+    }
+    fNptGen++;
+    IORWLockUnlock(fRw);
+    md->release();
+
+    if (rc == kIOReturnSuccess) {
+        RHV_STAT_INC(vmMaps);
+        RHV_INFO("VM map (lazy): uva 0x%llx -> gpa 0x%llx, %llu MiB, perm %u; chunks are wired on first touch",
+                 (unsigned long long)uva, (unsigned long long)gpa, (unsigned long long)(size >> 20), perm);
+    } else if (rc != kIOReturnUnsupported) {
+        RHV_STAT_INC(vmMapFailures);
+        RHV_WARN("VM map (lazy) failed (0x%x): uva 0x%llx gpa 0x%llx size 0x%llx", rc, (unsigned long long)uva,
+                 (unsigned long long)gpa, (unsigned long long)size);
+    }
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVVmShared::faultIn(task_t task, uint64_t gpa)
+{
+    const uint64_t page = gpa & ~(uint64_t)0xFFF;
+    LazyRange r = {};
+    bool have = false;
+    IORWLockRead(fRw);
+    const int i0 = lazyIndex(page);
+    if (i0 >= 0 && !fNpt.isMapped(page)) {
+        r    = fLazy[i0];
+        have = true;
+    }
+    IORWLockUnlock(fRw);
+    if (!have)
+        return kIOReturnSuccess;
+    if (r.task != task)
+        return kIOReturnNotPermitted;
+
+    const uint64_t c0 = page & ~(kLazyChunk - 1);
+    const uint64_t cs = c0 > r.gpa ? c0 : r.gpa;
+    const uint64_t ce = c0 + kLazyChunk < r.gpa + r.size ? c0 + kLazyChunk : r.gpa + r.size;
+
+    /* Wire outside the lock: a page-in from the compressor or swap sleeps, and every vCPU takes the lock for each VMRUN. */
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(r.uva + (cs - r.gpa), ce - cs, kIODirectionInOut, task);
+    if (!md)
+        return kIOReturnVMError;
+    IOReturn rc = md->prepare(kIODirectionInOut);
+    if (rc != kIOReturnSuccess) {
+        static volatile SInt32 logged;
+        if (OSIncrementAtomic(&logged) < 20)
+            RHV_ERR("VM lazy fault: cannot wire gpa 0x%llx-0x%llx: 0x%x", (unsigned long long)cs, (unsigned long long)ce, rc);
+        md->release();
+        return rc;
+    }
+
+    /*
+     * Only adds translations, so no vCPU needs to leave the guest and no ASID needs a flush (a not-present entry is never cached).
+     * The write lock still waits for every vCPU to pass an exit, which keeps Table's software state consistent; no kick: any exit
+     * (a host interrupt at the latest) lets it in.
+     */
+    IORWLockWrite(fRw);
+    const int i = lazyIndex(page);
+    if (i < 0 || fLazy[i].gpa != r.gpa || fLazy[i].size != r.size || fLazy[i].uva != r.uva) {
+        md->complete(kIODirectionInOut);   /* unmapped or carved while we wired: nothing to do, the guest runs again */
+        rc = kIOReturnSuccess;
+    } else {
+        rc = mapLazyChunkLocked(fLazy[i], cs, ce, md);
+    }
+    IORWLockUnlock(fRw);
+    md->release();
+    return rc;
+}
+
+/* protect over a lazy range: wire and map what the guest has not touched yet in [gpa, gpa+size), under the write lock. */
+IOReturn com_overlorddev_RyzenHVVmShared::materializeLocked(uint64_t gpa, uint64_t size)
+{
+    for (uint32_t i = 0; i < fNLazy; i++) {
+        const LazyRange r = fLazy[i];
+        const uint64_t lo = gpa > r.gpa ? gpa : r.gpa;
+        const uint64_t hi = gpa + size < r.gpa + r.size ? gpa + size : r.gpa + r.size;
+        for (uint64_t c0 = lo & ~(kLazyChunk - 1); c0 < hi; c0 += kLazyChunk) {
+            const uint64_t cs = c0 > r.gpa ? c0 : r.gpa;
+            const uint64_t ce = c0 + kLazyChunk < r.gpa + r.size ? c0 + kLazyChunk : r.gpa + r.size;
+            bool missing = false;
+            for (uint64_t g = cs; g < ce && !missing; g += 4096)
+                missing = !fNpt.isMapped(g);
+            if (!missing)
+                continue;
+            IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(r.uva + (cs - r.gpa), ce - cs, kIODirectionInOut, r.task);
+            if (!md)
+                return kIOReturnVMError;
+            IOReturn rc = md->prepare(kIODirectionInOut);
+            if (rc == kIOReturnSuccess)
+                rc = mapLazyChunkLocked(r, cs, ce, md);
+            md->release();
+            if (rc != kIOReturnSuccess)
+                return rc;
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+/* unmap: [gpa, gpa+size) stops being lazy. Pages already faulted in are unmapped by the caller as usual. */
+void com_overlorddev_RyzenHVVmShared::forgetLazyLocked(uint64_t gpa, uint64_t size)
+{
+    const uint64_t x = gpa, y = gpa + size;
+    for (uint32_t i = 0; i < fNLazy; i++) {
+        LazyRange &r = fLazy[i];
+        const uint64_t a = r.gpa, b = r.gpa + r.size;
+        if (y <= a || b <= x)
+            continue;
+        if (x <= a && y >= b) {                    /* all of it */
+            fLazy[i] = fLazy[--fNLazy];
+            i--;
+        } else if (x <= a) {                       /* the head */
+            r.uva += y - a;
+            r.gpa  = y;
+            r.size = b - y;
+        } else if (y >= b) {                       /* the tail */
+            r.size = x - a;
+        } else if (fNLazy < kMaxLazy) {            /* the middle: split */
+            LazyRange t = r;
+            t.uva += y - a;
+            t.gpa  = y;
+            t.size = b - y;
+            r.size = x - a;
+            fLazy[fNLazy++] = t;
+        } else {                                   /* the middle, no free slot: the tail becomes eager */
+            const LazyRange keep = r;
+            if (materializeLocked(y, b - y) != kIOReturnSuccess)
+                RHV_ERR("VM unmap: could not wire the rest of a lazy range (gpa 0x%llx-0x%llx); the guest will fault there",
+                        (unsigned long long)y, (unsigned long long)b);
+            fLazy[i]      = keep;
+            fLazy[i].size = x - a;
+        }
+    }
+}
 
 /* ---- one vCPU ---- */
 
@@ -914,12 +1198,24 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
     bool rescanned  = false;          /* CPUs that came online after the kext started: look for them once per run */
     bool needRescan = false;
     bool sleepWait  = false;          /* SVM is off for sleep: wait a little before going back to the client */
+    const uint64_t kNoLazyGpa = ~0ull;
+    uint64_t lazyGpa = kNoLazyGpa;    /* a first touch of lazy guest RAM, wired at the top of the loop where no lock is held */
 
     for (;;) {
         const uint64_t tPre0 = __builtin_ia32_rdtsc();
         if (needRescan) {             /* outside the page-table lock and with interrupts on: it runs a rendezvous and may allocate */
             needRescan = false;
             svm::rescan();
+        }
+        if (lazyGpa != kNoLazyGpa) {  /* lazy guest RAM: interrupts on, no lock held, may sleep for a page-in */
+            const uint64_t g = lazyGpa;
+            lazyGpa = kNoLazyGpa;
+            const IOReturn fr = fShared->faultIn(current_task(), g);
+            if (fr != kIOReturnSuccess) {
+                RHV_ERR("VmRun: vCPU %u cannot bring in guest RAM at gpa 0x%llx (0x%x)", fIndex, (unsigned long long)g, fr);
+                rc = fr;
+                break;
+            }
         }
         if (fKick) {                  /* hv_vcpu_interrupt from another thread */
             if (injectionWaiting()) {
@@ -1274,6 +1570,16 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 }
                 continue;
             }
+        }
+
+        /* First touch of a chunk of lazy guest RAM: the client never sees it. The page tables are still held for reading here. */
+        if (code == EXIT_NPF && fShared->lazyCandidate(v->control.exitInfo2)) {
+            if (v->control.exitIntInfo & (1u << 31)) {      /* the fault hit while an event was being delivered: deliver it again */
+                v->control.eventInj    = v->control.exitIntInfo;
+                v->control.eventInjErr = v->control.exitIntInfoErr;
+            }
+            lazyGpa = v->control.exitInfo2;
+            continue;
         }
         break;
     }

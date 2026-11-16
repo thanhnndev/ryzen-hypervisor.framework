@@ -67,8 +67,22 @@ public:
     IOReturn map(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t flags);
     IOReturn unmap(uint64_t gpa, uint64_t size);
     IOReturn protect(uint64_t gpa, uint64_t size, uint32_t flags);
-    /* Debugging (rhv-info hv readguest): reads guest physical memory through the nested page tables. Fails when a page is not mapped. */
+    /* Debugging (rhv-info hv readguest): reads guest physical memory through the nested page tables. Fails when a page is not mapped
+     * (with lazy RAM: also when the guest has not touched that chunk yet). */
     IOReturn readPhys(uint64_t gpa, void *dst, size_t len);
+
+    /*
+     * Lazy guest RAM. A large hv_vm_map (>= kLazyMinBytes) is not wired and entered into the NPT at once: the range is only
+     * recorded, and each 2 MiB chunk is wired and mapped the first time the guest touches it (a nested page fault that never
+     * reaches the client). Pages the guest never touches stay ordinary pageable memory of the client. Off with rhv_lazymap=0.
+     *
+     * lazyCandidate: is `gpa` inside a lazy range and not mapped yet? Caller holds rw() for reading.
+     * faultIn: wire and map the chunk around `gpa`. No lock held, interrupts on, may sleep (page-in). Called on the faulting
+     * vCPU's thread, so `task` is the client. Success also when there turned out to be nothing to do (another vCPU was faster,
+     * the range went away): the guest simply runs again, and a fault that is not ours then goes to the client as before.
+     */
+    bool     lazyCandidate(uint64_t gpa) const;
+    IOReturn faultIn(task_t task, uint64_t gpa);
 
     /* The vCPUs, for kicking them out of the guest. attach() fails with kIOReturnNoResources when the VM is full. */
     IOReturn attach(com_overlorddev_RyzenHVVm *vcpu, uint32_t *index);
@@ -83,7 +97,19 @@ public:
 
 private:
     bool     setup(uint32_t flags, task_t owner);
-    IOReturn mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa, uint64_t size, uint32_t perm);
+    IOReturn mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa, uint64_t size, uint32_t perm, bool prepared = false);
+
+    struct LazyRange {
+        uint64_t gpa, size, uva;
+        uint32_t perm;
+        task_t   task;       /* compared only: the range dies with the client's VM */
+    };
+    enum { kMaxLazy = 16 };
+    int      lazyIndex(uint64_t gpa) const;                          /* -1 when none; rw() held */
+    void     forgetLazyLocked(uint64_t gpa, uint64_t size);          /* unmap: cut [gpa, gpa+size) out of the lazy ranges */
+    IOReturn materializeLocked(uint64_t gpa, uint64_t size);         /* protect: map what is still lazy in [gpa, gpa+size) */
+    IOReturn mapLazyChunkLocked(const LazyRange &r, uint64_t cs, uint64_t ce, IOMemoryDescriptor *prepared);
+    IOReturn mapLazy(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t perm);   /* kIOReturnUnsupported: no slot */
     static void dropPage(Backing *b);
     static void releaseOwner(void *ctx, void *owner);
 
@@ -96,6 +122,8 @@ private:
     rhv::npt::Table           fNpt;
     uint64_t                  fPagesMapped;
     volatile uint64_t         fNptGen;
+    LazyRange                 fLazy[kMaxLazy];
+    uint32_t                  fNLazy;
 };
 
 class com_overlorddev_RyzenHVVm : public OSObject {
