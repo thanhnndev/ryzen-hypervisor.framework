@@ -474,6 +474,8 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmUnmap(OSObject *target, void *,
 {
     RHV_ME();
     RHV_ADMIN();
+    if (current_task() != me->fTask)       /* as sVmMap: lazy RAM builds descriptors on the mapping task */
+        return kIOReturnNotPermitted;
     RHV_RETAIN_VM(vm);
     IOReturn rc = vm->unmap(args->scalarInput[0], args->scalarInput[1]);
     vm->release();
@@ -485,6 +487,8 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmProtect(OSObject *target, void *,
 {
     RHV_ME();
     RHV_ADMIN();
+    if (current_task() != me->fTask)       /* as sVmMap: lazy RAM builds descriptors on the mapping task */
+        return kIOReturnNotPermitted;
     if (args->scalarInput[2] > 0xFFFFFFFFull)
         return kIOReturnBadArgument;
     RHV_RETAIN_VM(vm);

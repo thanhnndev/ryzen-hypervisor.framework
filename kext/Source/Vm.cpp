@@ -203,6 +203,7 @@ bool com_overlorddev_RyzenHVVmShared::init()
     fPagesMapped = 0;
     bzero(fLazy, sizeof(fLazy));
     fNLazy = 0;
+    fLazyGen = 0;
     fRw = IORWLockAlloc();
     fRegLock = IOLockAlloc();
     return fRw && fRegLock;
@@ -420,7 +421,14 @@ IOReturn com_overlorddev_RyzenHVVmShared::map(task_t task, uint64_t uva, uint64_
 
     kickAll();
     IORWLockWrite(fRw);            /* no vCPU is inside the guest while the tables change */
-    IOReturn rc = mapDescriptorLocked(md, gpa, size, perm);
+    /* A lazy range owns its GPAs even where nothing is mapped yet (0.7.22 returned Busy there, every page was mapped): an eager map
+     * inside it would later be evicted with the chunk and re-faulted from the lazy range's memory. */
+    IOReturn rc = kIOReturnSuccess;
+    for (uint32_t i = 0; i < fNLazy; i++)
+        if (gpa < fLazy[i].gpa + fLazy[i].size && fLazy[i].gpa < gpa + size)
+            rc = kIOReturnBusy;
+    if (rc == kIOReturnSuccess)
+        rc = mapDescriptorLocked(md, gpa, size, perm);
     fNptGen++;
     IORWLockUnlock(fRw);
 
@@ -512,6 +520,10 @@ IOReturn com_overlorddev_RyzenHVVmShared::protect(uint64_t gpa, uint64_t size, u
     if (rc == kIOReturnSuccess) {
         for (uint64_t off = 0; off < size; off += 4096)
             fNpt.protect(gpa + off, perm);
+        /* The protected pages are now an ordinary eager mapping with their own rights: drop them from the lazy ranges, so reclaim
+         * never evicts them and a re-fault never re-enters them with the range's original rights. Their wiring stays with their
+         * Backings until the client unmaps them. */
+        forgetLazyLocked(gpa, size);
         RHV_STAT_INC(vmProtects);
     }
     fNptGen++;
@@ -633,6 +645,7 @@ IOReturn com_overlorddev_RyzenHVVmShared::mapLazy(task_t task, uint64_t uva, uin
         r.uva  = uva;
         r.perm = perm;
         r.task = task;
+        r.gen  = ++fLazyGen;
         r.chunk     = chunks;
         r.chunkBase = chunkBase;
         r.nChunks   = chunks ? nChunks : 0;
@@ -703,7 +716,7 @@ IOReturn com_overlorddev_RyzenHVVmShared::faultIn(task_t task, uint64_t gpa)
      */
     IORWLockWrite(fRw);
     const int i = lazyIndex(page);
-    if (i < 0 || fLazy[i].gpa != r.gpa || fLazy[i].size != r.size || fLazy[i].uva != r.uva) {
+    if (i < 0 || fLazy[i].gen != r.gen) {
         md->complete(kIODirectionInOut);   /* unmapped or carved while we wired: nothing to do, the guest runs again */
         rc = kIOReturnSuccess;
     } else {
@@ -741,6 +754,8 @@ IOReturn com_overlorddev_RyzenHVVmShared::materializeLocked(uint64_t gpa, uint64
                 missing = !fNpt.isMapped(g);
             if (!missing)
                 continue;
+            if (r.task != current_task())      /* the descriptor is built on the stored task: only valid from inside it */
+                return kIOReturnNotPermitted;
             IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(r.uva + (cs - r.gpa), ce - cs, kIODirectionInOut, r.task);
             if (!md)
                 return kIOReturnVMError;
@@ -772,14 +787,18 @@ void com_overlorddev_RyzenHVVmShared::forgetLazyLocked(uint64_t gpa, uint64_t si
             r.uva += y - a;
             r.gpa  = y;
             r.size = b - y;
+            r.gen  = ++fLazyGen;
         } else if (y >= b) {                       /* the tail */
             r.size = x - a;
+            r.gen  = ++fLazyGen;
         } else if (fNLazy < kMaxLazy) {            /* the middle: split */
             LazyRange t = r;
             t.uva += y - a;
             t.gpa  = y;
             t.size = b - y;
+            t.gen  = ++fLazyGen;
             r.size = x - a;
+            r.gen  = ++fLazyGen;
             /* The tail gets its own copy of the chunk states (each range frees its own array). */
             t.chunk = nullptr;
             t.nChunks = 0;
@@ -804,6 +823,7 @@ void com_overlorddev_RyzenHVVmShared::forgetLazyLocked(uint64_t gpa, uint64_t si
                         (unsigned long long)y, (unsigned long long)b);
             fLazy[i]      = keep;
             fLazy[i].size = x - a;
+            fLazy[i].gen  = ++fLazyGen;
         }
     }
 }
@@ -940,10 +960,11 @@ thread_call_t     gCall     = nullptr;
 
 void arm()
 {
-    if (gCall && gOn && !gStopping) {
+    thread_call_t c = gCall;                 /* read once: stop() may clear it meanwhile */
+    if (c && gOn && !gStopping) {
         uint64_t deadline = 0;
         clock_interval_to_deadline(gPeriodMs, kMillisecondScale, &deadline);
-        thread_call_enter_delayed(gCall, deadline);
+        thread_call_enter_delayed(c, deadline);
     }
 }
 
@@ -1834,8 +1855,17 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
         /* First touch of a chunk of lazy guest RAM: the client never sees it. The page tables are still held for reading here. */
         if (code == EXIT_NPF && fShared->lazyCandidate(v->control.exitInfo2)) {
-            if (v->control.exitIntInfo & (1u << 31)) {      /* the fault hit while an event was being delivered: deliver it again */
-                v->control.eventInj    = v->control.exitIntInfo;
+            /*
+             * The fault hit while an event was being delivered: deliver it again. Not a software interrupt (type 4, INTn) or a
+             * software exception (type 3 with vector 3 = INT3 or 4 = INTO): their re-injection needs a return address in nextRip,
+             * which an NPF exit does not provide (NRIPS fills it only for instruction intercepts). RIP still points at the
+             * instruction, so the guest simply executes it again, as KVM does for INT3/INTO.
+             */
+            const uint32_t ii = v->control.exitIntInfo;
+            const uint32_t type = (ii >> 8) & 7, vec = ii & 0xFF;
+            const bool softEvent = type == 4 || (type == 3 && (vec == 3 || vec == 4));
+            if ((ii & (1u << 31)) && !softEvent) {
+                v->control.eventInj    = ii;
                 v->control.eventInjErr = v->control.exitIntInfoErr;
             }
             lazyGpa = v->control.exitInfo2;

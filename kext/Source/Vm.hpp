@@ -123,6 +123,7 @@ private:
         uint8_t *chunk;      /* per 2 MiB chunk: bits 0-5 scans without access, bit 7 unwired by reclaim; nullptr: no reclaim */
         uint64_t chunkBase;  /* gpa >> 21 of chunk[0]; stays put when the range is trimmed */
         uint32_t nChunks;    /* entries in chunk[] */
+        uint64_t gen;        /* fLazyGen when this range was created or last changed: faultIn's re-check (no ABA) */
     };
     enum : uint8_t { kChunkColdMask = 0x3F, kChunkEvicted = 0x80 };
     static uint8_t *allocChunks(uint32_t n);
@@ -147,6 +148,7 @@ private:
     volatile uint64_t         fNptGen;
     LazyRange                 fLazy[kMaxLazy];
     uint32_t                  fNLazy;
+    uint64_t                  fLazyGen;    /* under the write lock */
 };
 
 class com_overlorddev_RyzenHVVm : public OSObject {
