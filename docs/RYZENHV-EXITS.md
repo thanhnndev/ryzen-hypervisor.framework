@@ -193,3 +193,17 @@ instead of an IOAPIC. The per-vCPU LAPIC is still emulated by HyperKit: those ar
 
 **Bottom line:** nothing in RyzenHV is worth a kernel change for heat at idle. The next useful step is the busy-run
 measurement (1) with the owner's real work, then 2.
+
+## 7. Seen while putting Docker back: the orphaned HyperKit spins
+
+After `quit app "Docker"` (15:11), `com.docker.hyperkit` stayed alive with PPID 1 at ~0.7 % CPU, as in the known "orphaned
+hyperkit after Docker quits" shutdown stall. A plain `kill -TERM` made it worse: 102 % after 15 s, **203 %** after 35 s
+(state R). `kill -KILL` ended it. RyzenHV destroyed the VM cleanly ("tsc check (a VM was destroyed)"); `docker-agent serve`
+also stayed behind, idle.
+
+This is a heat source of its own, larger than idle Docker. Whenever Docker Desktop is quit and HyperKit does not exit,
+two cores can spin unnoticed until a reboot. Next steps (not done):
+- find where it spins: `sample` it during the spin (root, one dialog) and look at `~/.ryzenhv/hyperkit.log`;
+- check whether a vCPU thread loops on a time-slice exit after the device backends have gone.
+
+This ranks above items 3-5 for heat during work.
