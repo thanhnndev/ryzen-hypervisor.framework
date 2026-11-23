@@ -43,6 +43,9 @@ rhv::vmcb::AsidPool gAsidPool[RHV_MAX_CPUS];
 
 /* kRHVHvCache: which of the 0.7.22 VMRUN shortcuts are in use (rhv::vmcbcache). Read before every VMRUN. */
 volatile uint32_t gVmcbCache = rhv::vmcbcache::kAll;
+/* Goes up on every change of gVmcbCache: each vCPU then forgets its clean-bit snapshot and its ASID once (all dirty, new ASID,
+ * so the next VMRUN reloads everything and starts from an empty TLB), whatever the direction of the change. */
+volatile SInt32 gVmcbCacheGen = 1;
 
 static_assert(RHV_GUEST_RAM_SIZE % 4096 == 0, "guest RAM must be page sized");
 static_assert((int)RHV_MEM_READ == (int)rhv::npt::PERM_R && (int)RHV_MEM_WRITE == (int)rhv::npt::PERM_W &&
@@ -958,6 +961,7 @@ bool set(uint64_t flags)
     if (flags & ~(uint64_t)kAll)
         return false;
     gVmcbCache = (uint32_t)flags;
+    OSIncrementAtomic(&gVmcbCacheGen);
     RHV_INFO("VMRUN shortcuts now 0x%x (bit 0 clean bits, bit 1 keep ASID)", (unsigned)flags);
     return true;
 }
@@ -1158,6 +1162,7 @@ bool com_overlorddev_RyzenHVVm::init()
     fAsid.gen = 0; fAsid.asid = 0; fAsid.cpu = -1;
     fSeenNptGen = 0;                 /* never equal to nptGen(): the first VMRUN flushes */
     fSeenEpoch  = 0;
+    fSeenCacheGen = 0;                /* never equal to gVmcbCacheGen (starts at 1): the first VMRUN starts clean */
     fTlbFlushPending = true;
     {
         /* Where each field runEx reports lives, worked out once instead of after every exit. */
@@ -1611,6 +1616,12 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             const uint32_t ep = svm::epoch();
             if (ep != fSeenEpoch) {           /* SVM went off/on somewhere: nothing cached survives */
                 fSeenEpoch = ep;
+                fSnap.forget();
+                fAsid.cpu = -1;
+            }
+            const uint32_t cg = (uint32_t)gVmcbCacheGen;
+            if (cg != fSeenCacheGen) {        /* rhv-info hv cache changed: start clean once (all dirty, new ASID) */
+                fSeenCacheGen = cg;
                 fSnap.forget();
                 fAsid.cpu = -1;
             }

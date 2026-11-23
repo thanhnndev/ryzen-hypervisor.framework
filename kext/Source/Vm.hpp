@@ -262,6 +262,7 @@ private:
     rhv::vmcb::AsidSlot       fAsid;
     uint64_t                  fSeenNptGen;       /* fShared->nptGen() when this vCPU's ASID was last flushed */
     uint32_t                  fSeenEpoch;        /* svm::epoch() at the last VMRUN */
+    uint32_t                  fSeenCacheGen;     /* gVmcbCacheGen at the last VMRUN (rhv-info hv cache) */
     bool                      fTlbFlushPending;
     void                      profFlush();
 };
