@@ -1,0 +1,21 @@
+== docker-exit-probe 'docker-idle' 2026-11-23 15:09:54 window 61.317s
+package 15.3 W, Tctl 79 -> 60 C
+exits/s 7248   to user/s 6955   npf to user/s 5052   other to user/s 1903   in kernel/s 293
+per VMRUN us: pre 1.128  guest+switch 14.020  post .524
+per trap us: front end in .403  out .451  whole trap 18.759
+tlb flushes/s 445  new ASIDs/s 445  lazy faults/s 0  reclaim evicted/s 0
+
+top (60s average):
+PID    COMMAND          %CPU #TH   
+210    WindowServer     48.7 18/1  
+875    Claude Helper (R 25.3 26    
+0      kernel_task      19.4 339/25
+785    Claude Helper    18.2 25    
+15993  com.docker.hyper 17.5 18/1  
+1294   Microsoft Edge H 14.2 32    
+738    Microsoft Edge H 13.7 29/1  
+600    Claude           11.8 88    
+16968  coreaudiod       6.8  11    
+264    syspolicyd       6.6  3     
+2637   claude           3.5  28    
+12983  claude           2.9  26    

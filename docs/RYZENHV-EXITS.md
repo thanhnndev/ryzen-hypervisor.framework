@@ -152,3 +152,44 @@ The probe prints:
 
 Leave Docker as the owner wants it afterwards. With those numbers the watt column of section 3 becomes measured, and
 item 0 is answered.
+
+## 5. Measured: the owner's stack idle on 8 vCPUs (2026-11-23 15:09, 60 s, after 2 min settle)
+
+Stack: postgres, valkey, clamav, and object-storage (minio), which is still restart-looping. The pathcan backend and the
+emulator were not running. Raw output: `docs/measurements/2026-11-23-docker-*.txt`.
+
+| | value |
+|---|---|
+| exits/s | **7,248**: 6,955 to HyperKit (5,052 xAPIC NPF, 1,903 HLT/IO/other), 293 in the kernel |
+| hyperkit host CPU | **17.5 % of one core** (11-09, 24 vCPUs, idle containers: 73-124 %) |
+| package | 15.3 W (light desktop load alongside; 17.0 W at 14:54 without Docker, so within the noise) |
+| per VMRUN | pre 1.13 µs, guest+switch 14.0 µs, post 0.52 µs; front end 0.40 / 0.45 µs per trap |
+| TLB flushes | 445/s, each a new ASID after a vCPU moved to another core |
+| containers (`docker stats`) | postgres 8.1 % (health checks), valkey 0.3 %, clamav 0.0 %, object-storage restarting |
+
+Guest kernel command line (from the hyperkit arguments): `noapic tsc=reliable ...`. So the guest uses the legacy PIC
+instead of an IOAPIC. The per-vCPU LAPIC is still emulated by HyperKit: those are the 5k NPF/s.
+
+**Reading.**
+- An idle Docker stack now costs **about 0.2 core ≈ 0.5-1 W**. The 8-vCPU setting removed most of the 11-09 idle cost.
+  The exit work in it: 6,955 traps × ~4-5 µs ≈ 3 % of a core in round trips, plus HyperKit's own handling.
+- Idle Docker is **not a heat source any more**. The 62 W / 95 °C of 11-16 was the stack doing work:
+  - `pathcan-p0-pg` at 217 % inside the guest;
+  - the native Python backend at 3.1 cores;
+  - the emulator at 1 core;
+  - at EPP 0, with compression from the fully wired 12.3 GB guest.
+- Under that kind of load, RyzenHV's share is the ~1.3 cores measured on 11-16 with 24 vCPUs, less at 8.
+
+## 6. Ranking after the measurement
+
+| # | Change | Watts at the owner's loads | Effort / risk |
+|---|---|---|---|
+| 1 | **Measure a busy run before any kernel work**: the same probe while the owner's backend and tests run. Busy is the only state where the exit path is worth more than ~1 W. | n/a | none |
+| 2 | **Reclaim on by default** (0.7.23): keeps the guest's wired memory small when Docker, the emulator and browsers run together. That pressure produced the 11-16 compression (≈ 1 core). | 0 W idle, ~3 W under pressure | tiny / medium (soak first) |
+| 3 | **x2APIC for HyperKit's guest** (only if the LinuxKit guest accepts x2APIC without interrupt remapping). | idle < 0.2 W; busy ≈ 1 W | small-medium / medium |
+| 4 | **Cheaper RyzenHV exit** (pre is 1.13 µs here) | busy ≈ 0.5 W | medium / low-medium |
+| 5 | **In-kernel APIC + VZ, then in-kernel HLT handling, then AVIC** | idle ≈ 0.3-0.5 W; busy 2-4 W | weeks / high |
+| owner | object-storage (minio) restart loop, unchanged since 11-16 | small CPU, but a container start every few seconds | owner's compose config |
+
+**Bottom line:** nothing in RyzenHV is worth a kernel change for heat at idle. The next useful step is the busy-run
+measurement (1) with the owner's real work, then 2.
