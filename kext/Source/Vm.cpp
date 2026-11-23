@@ -41,6 +41,9 @@ const uint64_t kGuestPat = 0x0007040600070406ull;   /* power-on default PAT */
 /* Each CPU's guest ASIDs (VmcbCache.hpp). Only that CPU touches its pool, with interrupts off, right before VMRUN. */
 rhv::vmcb::AsidPool gAsidPool[RHV_MAX_CPUS];
 
+/* kRHVHvCache: which of the 0.7.22 VMRUN shortcuts are in use (rhv::vmcbcache). Read before every VMRUN. */
+volatile uint32_t gVmcbCache = rhv::vmcbcache::kAll;
+
 static_assert(RHV_GUEST_RAM_SIZE % 4096 == 0, "guest RAM must be page sized");
 static_assert((int)RHV_MEM_READ == (int)rhv::npt::PERM_R && (int)RHV_MEM_WRITE == (int)rhv::npt::PERM_W &&
                   (int)RHV_MEM_EXEC == (int)rhv::npt::PERM_X,
@@ -949,6 +952,18 @@ void com_overlorddev_RyzenHVVmShared::reclaimAll(uint32_t coldScans, uint32_t ma
 }
 
 namespace rhv {
+namespace vmcbcache {
+bool set(uint64_t flags)
+{
+    if (flags & ~(uint64_t)kAll)
+        return false;
+    gVmcbCache = (uint32_t)flags;
+    RHV_INFO("VMRUN shortcuts now 0x%x (bit 0 clean bits, bit 1 keep ASID)", (unsigned)flags);
+    return true;
+}
+uint32_t get() { return gVmcbCache; }
+} // namespace vmcbcache
+
 namespace reclaim {
 namespace {
 volatile uint32_t gOn       = 0;
@@ -1608,12 +1623,14 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 v->control.asid = 1;          /* cannot happen (VmCreate checked): the old behaviour, flush everything */
                 fAsid.cpu = -1;
             }
+            const uint32_t cache  = gVmcbCache;                  /* kRHVHvCache, read once for this VMRUN */
             const uint32_t dirty  = fSnap.dirty(v, runCpu);     /* after the ASID is in: it is a clean-bit field too */
             const uint64_t nptGen = fShared->nptGen();
             uint8_t tlb = TLB_DO_NOTHING;
             if (ar == rhv::vmcb::ASID_NEW_GENERATION)
                 tlb = TLB_FLUSH_ALL;          /* this CPU hands its ASIDs out again: flush them all, once per wrap */
-            else if (ar == rhv::vmcb::ASID_NEW || fTlbFlushPending || nptGen != fSeenNptGen || (dirty & rhv::vmcb::CLEAN_FLUSH_GROUPS))
+            else if (ar == rhv::vmcb::ASID_NEW || fTlbFlushPending || nptGen != fSeenNptGen || (dirty & rhv::vmcb::CLEAN_FLUSH_GROUPS) ||
+                     !(cache & rhv::vmcbcache::kKeepAsid))
                 tlb = svm::flushByAsid(runCpu) ? TLB_FLUSH_GUEST : TLB_FLUSH_ALL;
             if (tlb != TLB_DO_NOTHING) {
                 fTlbFlushPending = false;
@@ -1623,7 +1640,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             if (ar != rhv::vmcb::ASID_KEPT)
                 fProf[kProfAsidNew]++;
             v->control.tlbCtl = tlb;
-            v->control.clean  = (svmFix == 0 && svm::vmcbClean(runCpu)) ? (rhv::vmcb::CLEAN_KNOWN & ~dirty) : 0;
+            v->control.clean  = (svmFix == 0 && (cache & rhv::vmcbcache::kClean) && svm::vmcbClean(runCpu)) ? (rhv::vmcb::CLEAN_KNOWN & ~dirty) : 0;
         }
 
         /*

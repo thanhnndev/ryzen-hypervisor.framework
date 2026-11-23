@@ -149,7 +149,15 @@ enum {
     kRHVHvReclaim       = 9,  /* 0/1: off (default) / on */
     kRHVHvReclaimPeriod = 10, /* ms between scans, 1000..600000 (default 10000) */
     kRHVHvReclaimCold   = 11, /* scans without a guest access before a chunk is unwired, 1..63 (default 6) */
-    kRHVHvReclaimBatch  = 12  /* MiB unwired at most per scan per VM, 2..16384 (default 256) */
+    kRHVHvReclaimBatch  = 12, /* MiB unwired at most per scan per VM, 2..16384 (default 256) */
+    /*
+     * Since 0.7.24: what VMRUN may skip (VmcbCache.hpp), for A/B tests without a reboot. value = flags, kRHVHvGetValue only reads;
+     * state[0] = the flags now. Takes effect at the next VMRUN of every vCPU.
+     *   bit 0: VMCB clean bits (0.7.22). Off: every VMRUN reloads the whole VMCB, as up to 0.7.21.
+     *   bit 1: a vCPU keeps its ASID's TLB entries across exits (0.7.22). Off: every VMRUN flushes the vCPU's ASID, as up to 0.7.21.
+     * Default 3 (both on, the 0.7.22 behaviour).
+     */
+    kRHVHvCache         = 13
 };
 #define kRHVHvGetValue (~0ull)
 /* state bits returned in scalarOutput[0] */

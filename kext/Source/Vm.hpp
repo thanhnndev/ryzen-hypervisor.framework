@@ -50,6 +50,12 @@ bool     enabled();
 void     stop();                                /* kext stop: cancels and frees the thread call */
 } // namespace reclaim
 
+namespace vmcbcache {
+enum : uint32_t { kClean = 1u << 0, kKeepAsid = 1u << 1, kAll = kClean | kKeepAsid };
+bool     set(uint64_t flags);                  /* kRHVHvCache; false: bad value */
+uint32_t get();
+} // namespace vmcbcache
+
 } // namespace rhv
 
 

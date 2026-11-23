@@ -272,6 +272,17 @@ IOReturn com_overlorddev_RyzenHVUserClient::sHvControl(OSObject *target, void *,
         args->scalarOutput[1] = rhv::reclaim::enabled() ? 1 : 0;
         return kIOReturnSuccess;
     }
+    if (cmd == kRHVHvCache) {                                     /* VMRUN shortcuts (clean bits, kept ASIDs), Vm.cpp */
+        const uint64_t v64 = args->scalarInput[1];
+        if (v64 != kRHVHvGetValue) {
+            RHV_ADMIN();
+            if (!rhv::vmcbcache::set(v64))
+                return kIOReturnBadArgument;
+        }
+        args->scalarOutput[0] = rhv::vmcbcache::get();
+        args->scalarOutput[1] = 0;
+        return kIOReturnSuccess;
+    }
     if (cmd == kRHVHvSvmLimit || cmd == kRHVHvSvmRescan) {
         RHV_ADMIN();
         uint32_t enabled = 0;

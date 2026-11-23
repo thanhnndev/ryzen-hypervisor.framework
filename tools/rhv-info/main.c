@@ -283,6 +283,18 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
     } else if (argc > 3 && !strcmp(argv[2], "readguest")) {
         in[0] = kRHVHvReadGuest;
         in[1] = strtoull(argv[3], NULL, 16);
+    } else if (argc > 2 && !strcmp(argv[2], "cache")) {
+        /* cache [N]: VMRUN shortcuts, bit 0 VMCB clean bits, bit 1 keep ASIDs across exits (3 = 0.7.22 default, 0 = as 0.7.21) */
+        uint64_t cin[2] = { kRHVHvCache, argc > 3 ? strtoull(argv[3], NULL, 0) : kRHVHvGetValue }, cout[2] = { 0, 0 };
+        uint32_t cn = 2;
+        kern_return_t ckr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, cin, 2, cout, &cn);
+        if (ckr != KERN_SUCCESS) {
+            fprintf(stderr, "hv cache: 0x%x (value must be 0..3; changing it needs root)\n", ckr);
+            return 1;
+        }
+        printf("VMRUN shortcuts: 0x%llx (clean bits %s, keep ASID %s)\n", (unsigned long long)cout[0],
+               (cout[0] & 1) ? "on" : "off", (cout[0] & 2) ? "on" : "off");
+        return 0;
     } else if (argc > 2 && !strcmp(argv[2], "reclaim")) {
         /* reclaim [0|1] | reclaim period MS | reclaim cold N | reclaim batch MIB; no value: show all four */
         static const struct { const char *name; uint64_t cmd; const char *unit; } knobs[] = {
@@ -320,7 +332,7 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
         }
         return 0;
     } else if (argc > 2 && strcmp(argv[2], "status")) {
-        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA | reclaim [0|1 | period MS | cold N | batch MIB]]\n");
+        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA | reclaim [0|1 | period MS | cold N | batch MIB] | cache [0..3]]\n");
         return 2;
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, in, 2, out, &(uint32_t){ 2 });
