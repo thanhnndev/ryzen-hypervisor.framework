@@ -157,7 +157,16 @@ enum {
      *   bit 1: a vCPU keeps its ASID's TLB entries across exits (0.7.22). Off: every VMRUN flushes the vCPU's ASID, as up to 0.7.21.
      * Default 3 (both on, the 0.7.22 behaviour).
      */
-    kRHVHvCache         = 13
+    kRHVHvCache         = 13,
+    /*
+     * Since 0.7.24, debugging: trace guest exceptions (Vm.cpp rhv::exctrace). value = a bitmap of vectors, only #UD 6, #NM 7,
+     * #TS 10, #NP 11, #SS 12, #GP 13, #PF 14, #AC 17 (0 = off, the default); kRHVHvGetValue only reads, state[0] = the bitmap now.
+     * A traced exception the client does not intercept itself is recorded (vector, error code, rip, the first code bytes...) and
+     * the next VMRUN runs without that intercept, so the CPU raises and delivers it again itself (nested-fault rules untouched; #DF is not
+     * traceable for that reason).
+     */
+    kRHVHvExcTrace      = 14,
+    kRHVHvExcDump       = 15  /* debugging, value N: writes the newest N traced exceptions and the per-vector counts to the kernel log */
 };
 #define kRHVHvGetValue (~0ull)
 /* state bits returned in scalarOutput[0] */

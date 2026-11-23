@@ -56,6 +56,18 @@ bool     set(uint64_t flags);                  /* kRHVHvCache; false: bad value 
 uint32_t get();
 } // namespace vmcbcache
 
+/* rhv-info hv exctrace / excdump (kRHVHvExcTrace, kRHVHvExcDump): debugging, off by default. */
+namespace exctrace {
+enum : uint32_t {
+    /* #UD #NM #TS #NP #SS #GP #PF #AC: faults, re-executed exactly. Not #DF: which event EXITINTINFO holds then decides whether the
+     * replay gives the guest #DF or the second fault, so it is not traced. */
+    kAllowed = (1u << 6) | (1u << 7) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13) | (1u << 14) | (1u << 17)
+};
+bool     set(uint64_t mask);                   /* false: a vector outside kAllowed */
+uint32_t get();
+void     dump(uint32_t n);
+} // namespace exctrace
+
 } // namespace rhv
 
 
@@ -88,6 +100,7 @@ public:
     /* Debugging (rhv-info hv readguest): reads guest physical memory through the nested page tables. Fails when a page is not mapped
      * (with lazy RAM: also when the guest has not touched that chunk yet). */
     IOReturn readPhys(uint64_t gpa, void *dst, size_t len);
+    IOReturn readPhysLocked(uint64_t gpa, void *dst, size_t len);   /* the same, the caller holds rw() (a vCPU in its run loop) */
 
     /*
      * Lazy guest RAM. A large hv_vm_map (>= kLazyMinBytes) is not wired and entered into the NPT at once: the range is only
@@ -263,6 +276,12 @@ private:
     uint64_t                  fSeenNptGen;       /* fShared->nptGen() when this vCPU's ASID was last flushed */
     uint32_t                  fSeenEpoch;        /* svm::epoch() at the last VMRUN */
     uint32_t                  fSeenCacheGen;     /* gVmcbCacheGen at the last VMRUN (rhv-info hv cache) */
+
+    /* rhv-info hv exctrace (debugging, see Vm.cpp). All 0 while the trace is off. */
+    uint32_t                  fTraceAdded;       /* exception intercepts the trace added to the client's bitmap for this run */
+    uint32_t                  fTraceSkip;        /* vectors the next VMRUN lets the CPU deliver itself (just traced) */
+    uint64_t                  fTraceLastRip;     /* the code bytes are read again only when the rip changes */
+    void                      traceException(unsigned vec);
     bool                      fTlbFlushPending;
     void                      profFlush();
 };

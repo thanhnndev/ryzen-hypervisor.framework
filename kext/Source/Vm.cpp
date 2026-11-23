@@ -47,6 +47,27 @@ volatile uint32_t gVmcbCache = rhv::vmcbcache::kAll;
  * so the next VMRUN reloads everything and starts from an empty TLB), whatever the direction of the change. */
 volatile SInt32 gVmcbCacheGen = 1;
 
+/*
+ * rhv-info hv exctrace (kRHVHvExcTrace): debugging of a guest that keeps faulting where no exit shows it. gExcTrace is a bitmap of
+ * exception vectors (rhv::exctrace::kAllowed), 0 by default; while it is 0 no intercept is added and the run loop is as before.
+ * A vCPU intercepts those vectors in addition to the client's own, records each one in gExcRing, and lets the next VMRUN run
+ * without that intercept: the guest re-executes the faulting instruction (or the event delivery it hit) and the CPU raises the
+ * exception again and delivers it itself, so error codes, CR2, RF and the nested-fault rules (#DF, triple fault) stay the CPU's.
+ * #DF itself cannot be traced (exctrace::kAllowed).
+ */
+volatile uint32_t gExcTrace = 0;
+struct ExcRec {
+    uint32_t seq, vm, vcpu, vec, err, intInfo, intErr;
+    uint16_t cs;
+    uint8_t  cpl, nbytes;
+    uint64_t rip, rsp, rflags, info2, cr0, cr2, cr3;
+    uint8_t  bytes[16];
+};
+constexpr unsigned kExcN = 1024;                   /* a power of two */
+ExcRec gExcRing[kExcN];
+volatile SInt32 gExcPos = 0;                       /* records written so far */
+volatile SInt32 gExcCount[32];                     /* per vector, since the trace was last switched on */
+
 static_assert(RHV_GUEST_RAM_SIZE % 4096 == 0, "guest RAM must be page sized");
 static_assert((int)RHV_MEM_READ == (int)rhv::npt::PERM_R && (int)RHV_MEM_WRITE == (int)rhv::npt::PERM_W &&
                   (int)RHV_MEM_EXEC == (int)rhv::npt::PERM_X,
@@ -453,8 +474,15 @@ IOReturn com_overlorddev_RyzenHVVmShared::map(task_t task, uint64_t uva, uint64_
 
 IOReturn com_overlorddev_RyzenHVVmShared::readPhys(uint64_t gpa, void *dst, size_t len)
 {
-    uint8_t *out = (uint8_t *)dst;
     IORWLockRead(fRw);                     /* a map/unmap waits; the pages are pinned while they are mapped */
+    const IOReturn rc = readPhysLocked(gpa, dst, len);
+    IORWLockUnlock(fRw);
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVVmShared::readPhysLocked(uint64_t gpa, void *dst, size_t len)
+{
+    uint8_t *out = (uint8_t *)dst;
     IOReturn rc = kIOReturnSuccess;
     while (len) {
         const size_t inPage = 4096 - (size_t)(gpa & 0xFFF);
@@ -477,7 +505,6 @@ IOReturn com_overlorddev_RyzenHVVmShared::readPhys(uint64_t gpa, void *dst, size
         }
         out += n; gpa += n; len -= n;
     }
-    IORWLockUnlock(fRw);
     return rc;
 }
 
@@ -968,6 +995,50 @@ bool set(uint64_t flags)
 uint32_t get() { return gVmcbCache; }
 } // namespace vmcbcache
 
+namespace exctrace {
+bool set(uint64_t mask)
+{
+    if (mask & ~(uint64_t)kAllowed)
+        return false;
+    if (mask && !gExcTrace) {               /* switched on: a fresh ring and fresh counts */
+        gExcPos = 0;
+        bzero((void *)gExcCount, sizeof(gExcCount));
+    }
+    gExcTrace = (uint32_t)mask;
+    OSIncrementAtomic(&gVmcbCacheGen);      /* the intercept vector is a clean-bit group: every vCPU starts clean once, as for hv cache */
+    RHV_INFO("exception trace now 0x%x%s", (unsigned)mask, mask ? " (debugging: these vectors exit once each, then the CPU delivers them)" : " (off)");
+    return true;
+}
+uint32_t get() { return gExcTrace; }
+
+void dump(uint32_t n)
+{
+    const uint32_t total = (uint32_t)gExcPos;
+    RHV_INFO("exctrace: mask 0x%x, %u recorded; per vector: #UD %d #NM %d #TS %d #NP %d #SS %d #GP %d #PF %d #AC %d", (unsigned)gExcTrace, total,
+             (int)gExcCount[6], (int)gExcCount[7], (int)gExcCount[10], (int)gExcCount[11], (int)gExcCount[12],
+             (int)gExcCount[13], (int)gExcCount[14], (int)gExcCount[17]);
+    if (n > kExcN)
+        n = kExcN;
+    if (n > total)
+        n = total;
+    RHV_INFO("exctrace: the newest %u, oldest first (seq vm vcpu vector err exitintinfo/err rip rsp rflags info2(#PF address) cr0 cr2 cr3 cs cpl code)", n);
+    for (uint32_t i = total - n; i < total; i++) {
+        const ExcRec r = gExcRing[i & (kExcN - 1)];
+        if (r.seq != i + 1)
+            continue;                        /* overwritten while reading */
+        char b[16 * 3 + 1];
+        unsigned k = 0;
+        for (unsigned j = 0; j < r.nbytes && j < 16; j++)
+            k += (unsigned)snprintf(b + k, sizeof(b) - k, "%02x ", r.bytes[j]);
+        b[k] = 0;
+        RHV_INFO("x%u vm%u v%u #%u err %x ii %x/%x ip %llx sp %llx fl %llx i2 %llx cr0 %llx cr2 %llx cr3 %llx cs %x c%u: %s", r.seq, r.vm, r.vcpu, r.vec,
+                 r.err, r.intInfo, r.intErr, (unsigned long long)r.rip, (unsigned long long)r.rsp, (unsigned long long)r.rflags,
+                 (unsigned long long)r.info2, (unsigned long long)r.cr0, (unsigned long long)r.cr2, (unsigned long long)r.cr3, r.cs, r.cpl,
+                 r.nbytes ? b : "(code not read)");
+    }
+}
+} // namespace exctrace
+
 namespace reclaim {
 namespace {
 volatile uint32_t gOn       = 0;
@@ -1163,6 +1234,9 @@ bool com_overlorddev_RyzenHVVm::init()
     fSeenNptGen = 0;                 /* never equal to nptGen(): the first VMRUN flushes */
     fSeenEpoch  = 0;
     fSeenCacheGen = 0;                /* never equal to gVmcbCacheGen (starts at 1): the first VMRUN starts clean */
+    fTraceAdded = 0;
+    fTraceSkip = 0;
+    fTraceLastRip = ~0ull;
     fTlbFlushPending = true;
     {
         /* Where each field runEx reports lives, worked out once instead of after every exit. */
@@ -1608,6 +1682,19 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             break;
         }
         /*
+         * rhv-info hv exctrace (debugging, see gExcTrace): add the traced vectors the client does not intercept itself, minus the ones
+         * just traced (this VMRUN lets the CPU deliver them). Before the clean-bit check below, which sees the intercept change. With the
+         * trace off and nothing added, the client's bitmap is not touched.
+         */
+        if (fVmx) {
+            const uint32_t trace = gExcTrace;
+            if (trace | fTraceAdded) {
+                const uint32_t client = v->control.interceptExc & ~fTraceAdded;
+                fTraceAdded = trace & ~fTraceSkip & ~client;
+                v->control.interceptExc = client | fTraceAdded;
+            }
+        }
+        /*
          * ASID and clean bits (VmcbCache.hpp). Up to 0.7.21 all vCPUs shared ASID 1 and every entry flushed it, so the guest refilled
          * its TLB after each exit. Now a vCPU keeps its ASID on this CPU and flushes it only when the translations behind it changed.
          * Interrupts are off: this CPU's pool is ours alone.
@@ -1717,6 +1804,8 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         const uint64_t tGuest1 = __builtin_ia32_rdtsc();
         fRunCpu = -1;
         fSnap.take(v, runCpu);                /* before anything writes the VMCB again */
+        if (fTraceSkip)
+            fTraceSkip = 0;                   /* exctrace: the CPU had its chance to deliver them; intercepted again from the next VMRUN */
 
         if (fVmx && fHasTscAux) {
             const uint64_t g = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);
@@ -1796,6 +1885,31 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 v->control.eventInjErr = v->control.exitIntInfoErr;
             }
             /* The host needed the CPU. It has it now; run on unless the slice is over. */
+            if (mach_absolute_time() >= deadline && !injectionWaiting()) {
+                timeslice = true;
+                takePendingEvent();
+                break;
+            }
+            continue;
+        }
+
+        /*
+         * rhv-info hv exctrace: an exception only the trace intercepts. The client never sees it. Record it, then go back in without that
+         * intercept: RIP still points at the faulting instruction, so the CPU raises the exception again and delivers it itself. An event
+         * whose delivery it hit is injected again (it raises the exception again during that delivery); not a software interrupt or
+         * software exception, whose re-injection needs nextRip: RIP points at the INTn/INT3/INTO and the guest executes it again.
+         */
+        if (code >= 0x40 && code <= 0x5F && (fTraceAdded & (1u << (code - 0x40)))) {
+            const unsigned vec = (unsigned)(code - 0x40);
+            traceException(vec);
+            fTraceSkip |= 1u << vec;
+            const uint32_t ii = v->control.exitIntInfo;
+            const uint32_t type = (ii >> 8) & 7, iv = ii & 0xFF;
+            const bool softEvent = type == 4 || (type == 3 && (iv == 3 || iv == 4));
+            if ((ii & (1u << 31)) && !softEvent) {
+                v->control.eventInj    = ii;
+                v->control.eventInjErr = v->control.exitIntInfoErr;
+            }
             if (mach_absolute_time() >= deadline && !injectionWaiting()) {
                 timeslice = true;
                 takePendingEvent();
@@ -1902,6 +2016,11 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         break;
     }
 
+    if (fTraceAdded) {                /* exctrace: the client gets its own exception bitmap back */
+        v->control.interceptExc &= ~fTraceAdded;
+        fTraceAdded = 0;
+    }
+
     if (sleepWait)
         IOSleep(20);
 
@@ -1954,6 +2073,75 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         profFlush();
     IOLockUnlock(fLock);
     return rc;
+}
+
+/*
+ * exctrace: the guest's code at a linear address, read through its own page tables (4-level long mode, or no paging) and the nested
+ * ones. Called in the run loop, which holds the page tables for reading. Returns how many bytes it read (up to 16, not past the page).
+ */
+static uint8_t fetchGuestCode(com_overlorddev_RyzenHVVmShared *sh, const Vmcb *v, uint64_t lin, uint8_t *out)
+{
+    const uint64_t kAddr = 0x000FFFFFFFFFF000ull;
+    uint64_t pa = lin;
+    if (v->save.cr0 & (1ull << 31)) {                                  /* CR0.PG */
+        if (!(v->save.efer & (1ull << 10)) || (v->save.cr4 & (1ull << 12)))
+            return 0;                                                  /* only long mode with 4 levels (no LA57, no 32-bit paging) */
+        uint64_t table = v->save.cr3 & kAddr;
+        bool ok = false;
+        for (int level = 3; level >= 0; level--) {
+            const uint64_t shift = 12 + 9 * (uint64_t)level;
+            uint64_t e = 0;
+            if (sh->readPhysLocked(table + ((lin >> shift) & 511) * 8, &e, sizeof(e)) != kIOReturnSuccess || !(e & 1))
+                return 0;
+            if (level == 0 || ((e & 0x80) && (level == 1 || level == 2))) {
+                const uint64_t mask = (1ull << shift) - 1;
+                pa = (e & kAddr & ~mask) | (lin & mask);
+                ok = true;
+                break;
+            }
+            table = e & kAddr;
+        }
+        if (!ok)
+            return 0;
+    }
+    size_t n = 16;
+    const size_t toPage = 4096 - (size_t)(pa & 0xFFF);
+    if (n > toPage)
+        n = toPage;
+    return sh->readPhysLocked(pa, out, n) == kIOReturnSuccess ? (uint8_t)n : 0;
+}
+
+void com_overlorddev_RyzenHVVm::traceException(unsigned vec)
+{
+    const Vmcb *v = (const Vmcb *)fVmcb.va;
+    OSIncrementAtomic(&gExcCount[vec & 31]);
+    const SInt32 pos = OSIncrementAtomic(&gExcPos);
+    ExcRec r;
+    bzero(&r, sizeof(r));
+    r.seq     = (uint32_t)pos + 1;
+    r.vm      = (uint32_t)fShared->id();
+    r.vcpu    = fIndex;
+    r.vec     = vec;
+    r.err     = (uint32_t)v->control.exitInfo1;
+    r.info2   = v->control.exitInfo2;
+    r.intInfo = v->control.exitIntInfo;
+    r.intErr  = v->control.exitIntInfoErr;
+    r.rip     = v->save.rip;
+    r.rsp     = v->save.rsp;
+    r.rflags  = v->save.rflags;
+    r.cr0     = v->save.cr0;
+    r.cr2     = v->save.cr2;
+    r.cr3     = v->save.cr3;
+    r.cs      = v->save.cs.selector;
+    r.cpl     = v->save.cpl;
+    /* The code bytes cost a page walk: read them when the rip changes (a loop on one instruction is read once), and every 256th record. */
+    const bool longMode = (v->save.efer & (1ull << 10)) != 0;
+    const uint64_t lin = longMode ? v->save.rip : ((v->save.cs.base + v->save.rip) & 0xFFFFFFFFull);
+    if (lin != fTraceLastRip || (r.seq & 255) == 0) {
+        fTraceLastRip = lin;
+        r.nbytes = fetchGuestCode(fShared, v, lin, r.bytes);
+    }
+    gExcRing[(uint32_t)pos & (kExcN - 1)] = r;
 }
 
 IOReturn com_overlorddev_RyzenHVVm::msrOp(uint32_t op, uint32_t msrNum, uint64_t value, uint64_t *out)

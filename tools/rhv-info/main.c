@@ -295,6 +295,20 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
         printf("VMRUN shortcuts: 0x%llx (clean bits %s, keep ASID %s)\n", (unsigned long long)cout[0],
                (cout[0] & 1) ? "on" : "off", (cout[0] & 2) ? "on" : "off");
         return 0;
+    } else if (argc > 2 && (!strcmp(argv[2], "exctrace") || !strcmp(argv[2], "excdump"))) {
+        /* exctrace [MASK]: trace these guest exception vectors (debugging; 0 = off); excdump [N]: log the newest N to `rhv-info log` */
+        const int dump = !strcmp(argv[2], "excdump");
+        uint64_t xin[2] = { dump ? kRHVHvExcDump : kRHVHvExcTrace,
+                            dump ? (argc > 3 ? strtoull(argv[3], NULL, 0) : 64) : (argc > 3 ? strtoull(argv[3], NULL, 0) : kRHVHvGetValue) },
+                 xout[2] = { 0, 0 };
+        uint32_t xn = 2;
+        kern_return_t xkr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, xin, 2, xout, &xn);
+        if (xkr != KERN_SUCCESS) {
+            fprintf(stderr, "hv %s: 0x%x (vectors allowed: 6 7 10 11 12 13 14 17, e.g. 0x27cc0 for all; changing it needs root)\n", argv[2], xkr);
+            return 1;
+        }
+        printf("exception trace: 0x%llx%s\n", (unsigned long long)xout[0], dump ? " (records written to the kernel log: rhv-info log)" : "");
+        return 0;
     } else if (argc > 2 && !strcmp(argv[2], "reclaim")) {
         /* reclaim [0|1] | reclaim period MS | reclaim cold N | reclaim batch MIB; no value: show all four */
         static const struct { const char *name; uint64_t cmd; const char *unit; } knobs[] = {
@@ -332,7 +346,7 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
         }
         return 0;
     } else if (argc > 2 && strcmp(argv[2], "status")) {
-        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA | reclaim [0|1 | period MS | cold N | batch MIB] | cache [0..3]]\n");
+        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA | reclaim [0|1 | period MS | cold N | batch MIB] | cache [0..3] | exctrace [MASK] | excdump [N]]\n");
         return 2;
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, in, 2, out, &(uint32_t){ 2 });
