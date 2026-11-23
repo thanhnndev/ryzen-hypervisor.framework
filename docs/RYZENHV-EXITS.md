@@ -194,16 +194,52 @@ instead of an IOAPIC. The per-vCPU LAPIC is still emulated by HyperKit: those ar
 **Bottom line:** nothing in RyzenHV is worth a kernel change for heat at idle. The next useful step is the busy-run
 measurement (1) with the owner's real work, then 2.
 
-## 7. Seen while putting Docker back: the orphaned HyperKit spins
+## 7. The orphaned HyperKit and its 200 % spin: a HyperKit deadlock, not RyzenHV (reproduced 2026-11-23 15:16-15:19)
 
-After `quit app "Docker"` (15:11), `com.docker.hyperkit` stayed alive with PPID 1 at ~0.7 % CPU, as in the known "orphaned
-hyperkit after Docker quits" shutdown stall. A plain `kill -TERM` made it worse: 102 % after 15 s, **203 %** after 35 s
-(state R). `kill -KILL` ended it. RyzenHV destroyed the VM cleanly ("tsc check (a VM was destroyed)"); `docker-agent serve`
-also stayed behind, idle.
+**Reproduction.** Docker Desktop 4.98.0 with `EngineTypeMac: hyperkit`, stack up:
+1. `osascript -e 'quit app "Docker"'`. The backend logs `wait status: 13`, `failed to wait(): ... broken pipe`, and
+   `monitor exited ... services: exit 0`. **`com.docker.hyperkit` stays alive with PPID 1.**
+2. The guest goes quiet within ~30 s. All 8 vCPU threads wait in `xh_vm_run` → `pthread_cond_wait` (guest HLT),
+   hyperkit is at ~0 % CPU, and RyzenHV counts ~150 exits/s.
+3. `kill -TERM <hyperkit>`. HyperKit's handler presses the guest's ACPI power button. About 25 s later hyperkit jumps to
+   **~200 % CPU** (state R) and RyzenHV counts 13.5k exits/s. It never exits; KILL ends it.
+4. The next Docker Desktop start cleans up the same way: `lingering-processes: silently killing lingering process with
+   pid ... (com.docker.hyperkit)`.
 
-This is a heat source of its own, larger than idle Docker. Whenever Docker Desktop is quit and HyperKit does not exit,
-two cores can spin unnoticed until a reboot. Next steps (not done):
-- find where it spins: `sample` it during the spin (root, one dialog) and look at `~/.ryzenhv/hyperkit.log`;
-- check whether a vCPU thread loops on a time-slice exit after the device backends have gone.
+**What spins** (`sample`, no root, `docs/measurements/2026-11-23-hyperkit-spin.sample.txt`):
+- vcpu:1 has been blocked for the whole sample in `vmexit_inout → pci_emul_io_handler → vi_pci_write →
+  pci_vtnet_reset → pthread_mutex_lock`. The guest's power-off path resets the virtio-net device.
+- vcpu:3 and vcpu:5 are in `hv_vmx_vcpu_run` 100 % of the time: the guest spins on two CPUs, waiting for vcpu:1.
+- net:ipc:rx sits in `pci_vtnet_tap_select_func → vmn_read → usleep`.
 
-This ranks above items 3-5 for heat during work.
+**Why** (HyperKit binary, `_vmn_read.915` and `_pci_vtnet_tap_select_func.905`):
+- The receive thread calls `pthread_mutex_lock` (the rx mutex) before `vmn_read`.
+- When the read from vpnkit fails (vpnkit lives in the backend, which has exited), `vmn_read` calls
+  `push_power_button()` and then loops `for (;;) usleep(1000000);`, **still holding the rx mutex**.
+- When the guest shuts down and resets virtio-net, `pci_vtnet_reset` takes the same mutex and blocks forever.
+- The guest's other CPUs spin while that vCPU never returns from its I/O exit.
+
+That is a HyperKit deadlock. RyzenHV runs the two guest CPUs it is given, and the VM is destroyed cleanly on KILL
+(`tsc check (a VM was destroyed)`). The trigger is Docker Desktop 4.98's quit path: it leaves the deprecated HyperKit
+engine running and relies on the next start to kill it. HyperKit's default is now Virtualization.framework; the owner
+keeps HyperKit for RyzenHV.
+
+**Cost.**
+- After every Docker quit, an orphaned hyperkit (8 GB guest) stays until the next Docker start or the shutdown.
+  Idle it costs ~0 %.
+- **Anything that sends it TERM turns it into a 2-core spin that never ends**: a `kill`, or the system shutdown, where
+  launchd sends SIGTERM first. At shutdown that means two spinning cores until launchd's SIGKILL timeout, i.e. a stall.
+  This matches the "orphaned hyperkit after Docker quits" shutdown stall in `docs/STATE.md`. The 11-23 13:11 restart
+  (3 min 51 s) shows no hyperkit in the unified log of 13:09-13:16, so it is not proven to be this.
+
+**Fixes, cheapest first (none applied):**
+1. **Owner habit:** leave Docker Desktop running, or after quitting it run `pkill -KILL -f bin/com.docker.hyperkit`
+   (what Docker's own next start does).
+2. **A small LaunchAgent in RyzenHV's Docker tooling:** when `com.docker.hyperkit` has PPID 1 (its backend is gone),
+   SIGKILL it, exactly like Docker's `lingering-processes` cleanup. Also handle the shutdown case: kill it before
+   launchd's TERM. Small, low risk. It leaves the guest disk as Docker's own cleanup does (Docker.raw already sees this
+   on every start after a quit).
+3. **Patch HyperKit in memory** (the shim's pattern mechanism) so that `vmn_read`'s park loop drops the rx mutex, or
+   exits the process instead of parking. Correct, but it is a patch of Docker's binary and is moot if Docker removes
+   HyperKit.
+4. **Docker on Virtualization.framework** (section 6, item 5) removes HyperKit and this bug together. Large.
