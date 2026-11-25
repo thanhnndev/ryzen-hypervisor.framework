@@ -284,6 +284,11 @@ private:
     uint64_t                  fTraceSkipRip;     /* rip of the exception fTraceSkip lets through */
     bool                      fTraceReplay;      /* that VMRUN left before the guest moved: the next record there is a replay */
     void                      traceException(unsigned vec);
+
+    /* CLTS and LMSW (Vm.cpp, the CR0 write intercept without decode assist). */
+    uint64_t                  gpr(unsigned i) const;
+    int                       decodeCr0Op(uint16_t *src, bool *mem);   /* 0 unknown, 1 CLTS, 2 LMSW (src = its 16-bit operand) */
+    uint64_t                  fCrQual;           /* ~0: none; else the VMX qualification recordExit must report for this exit */
     bool                      fTlbFlushPending;
     void                      profFlush();
 };
