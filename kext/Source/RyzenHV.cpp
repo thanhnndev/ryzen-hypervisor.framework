@@ -10,7 +10,7 @@
 
 #define super IOService
 
-#define RHV_VERSION "0.7.22"
+#define RHV_VERSION "0.7.24"
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHV, IOService)
 
