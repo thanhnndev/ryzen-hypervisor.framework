@@ -1697,6 +1697,21 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             break;
         }
         /*
+         * The guest's XCR0 may only hold state this thread has enabled. Checked before the ASID and TLB bookkeeping below: from
+         * there to VMRUN nothing may leave the loop, or a flush that was decided (and marked done) would never reach the CPU.
+         */
+        const uint64_t guestX = fGuestXcr0 | rhv::fpu::XCR0_X87 | rhv::fpu::XCR0_SSE;
+        const uint64_t hostX = rhv::fpu::xgetbv0();
+        if (guestX & ~hostX) {
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            RHV_ERR("VmRun: guest XCR0 0x%llx needs state this thread has not enabled (0x%llx)",
+                    (unsigned long long)guestX, (unsigned long long)hostX);
+            rc = kIOReturnUnsupported;
+            break;
+        }
+
+        /*
          * rhv-info hv exctrace (debugging, see gExcTrace): add the traced vectors the client does not intercept itself, minus the ones
          * just traced (this VMRUN lets the CPU deliver them). Before the clean-bit check below, which sees the intercept change. With the
          * trace off and nothing added, the client's bitmap is not touched.
@@ -1766,18 +1781,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
          * client sees (and a later XSETBV sets) is fGuestXcr0. The only visible difference is that XGETBV in
          * such a guest reads 3 instead of 1.
          */
-        const uint64_t guestX = fGuestXcr0 | rhv::fpu::XCR0_X87 | rhv::fpu::XCR0_SSE;
         const bool wasTs = rhv::fpu::clearTs();
-        const uint64_t hostX = rhv::fpu::xgetbv0();
-        if (guestX & ~hostX) {
-            fRunCpu = -1;
-            rhv::fpu::restoreTs(wasTs);
-            ml_set_interrupts_enabled(ints);
-            RHV_ERR("VmRun: guest XCR0 0x%llx needs state this thread has not enabled (0x%llx)",
-                    (unsigned long long)guestX, (unsigned long long)hostX);
-            rc = kIOReturnUnsupported;
-            break;
-        }
         rhv::fpu::xsave(fHostFpu.va, hostX);
         if (guestX != hostX)
             rhv::fpu::xsetbv0(guestX);
