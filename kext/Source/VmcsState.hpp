@@ -432,6 +432,9 @@ public:
      * without it the interrupt is lost (QEMU's APIC then keeps it "in service" and blocks every lower vector). 0 when
      * there is none: the field must not keep the previous exit's value either.
      */
+    /* After recordExit: the qualification of a CR0 write that was CLTS or LMSW (decoded by Vm::decodeCr0Op; SVM's EXITINFO1 has no operand). */
+    void setQualification(uint64_t q) { set(F_RO_QUALIFICATION, q); }
+
     void recordSynthetic(uint32_t reason, uint32_t idtInfo = 0, uint32_t idtError = 0)
     {
         set(F_RO_EXIT_REASON, reason);

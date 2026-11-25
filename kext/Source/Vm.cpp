@@ -1250,6 +1250,7 @@ bool com_overlorddev_RyzenHVVm::init()
     fTraceLastRip = ~0ull;
     fTraceSkipRip = 0;
     fTraceReplay = false;
+    fCrQual = ~0ull;
     fTlbFlushPending = true;
     {
         /* Where each field runEx reports lives, worked out once instead of after every exit. */
@@ -1540,6 +1541,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             RHV_WARN("VmRun: skip requested but the last exit has no next_rip, RIP unchanged");
     }
     fHaveNextRip = false;
+    fCrQual = ~0ull;                  /* set only by a CLTS/LMSW exit this run hands to the client */
 
     if (fFirstRun) {
         fFirstRun = false;
@@ -2016,6 +2018,66 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             }
         }
 
+        /*
+         * CLTS and LMSW. SVM intercepts every write to CR0 once the client masks any CR0 bit, and gives no operand for these two
+         * (EXITINFO1 bit 63 clear), so up to 0.7.24 they reached the client as "MOV to CR0 from RAX" and the guest's CR0 became its
+         * RAX. VMX exits on them only in these cases (SDM Vol. 3, 26.3, "Changes to instruction behavior in VMX non-root operation"):
+         * CLTS when TS is set in both the CR0 guest/host mask and the read shadow; LMSW when a masked bit of MP/EM/TS differs from
+         * the shadow, or PE is masked, clear in the shadow and set in the source. Otherwise the instruction completes here as on
+         * VMX (masked bits keep their value, LMSW never clears PE) and the client does not see it. When VMX would exit, the client
+         * gets the right qualification: access type 2 (CLTS) or 3 (LMSW, the source in bits 31:16, bit 6 for a memory operand).
+         * An instruction that cannot be decoded keeps the old report.
+         */
+        if (fVmx && (code == 0x10 || code == 0x65) && !(v->control.exitInfo1 >> 63) && v->control.nextRip) {
+            uint16_t src = 0;
+            bool mem = false;
+            const int op = decodeCr0Op(&src, &mem);
+            if (op) {
+                const uint64_t mask = fVmcs.get(0x6000), shadow = fVmcs.get(0x6004), TS = 1u << 3;
+                uint64_t cr0 = v->save.cr0;
+                bool exitVmx;
+                if (op == 1) {
+                    exitVmx = (mask & TS) && (shadow & TS);
+                    if (!exitVmx && !(mask & TS))
+                        cr0 &= ~TS;
+                } else {
+                    exitVmx = ((mask & 0xE) & (src ^ shadow)) != 0 || ((mask & 1) && (src & 1) && !(shadow & 1));
+                    if (!exitVmx) {
+                        const uint64_t free = 0xE & ~mask;
+                        cr0 = (cr0 & ~free) | (src & free);
+                        if (!(mask & 1) && (src & 1))
+                            cr0 |= 1;
+                    }
+                }
+                if (exitVmx) {
+                    fCrQual = (op == 1) ? (2u << 4) : ((3u << 4) | (mem ? (1u << 6) : 0) | ((uint64_t)src << 16));
+                    break;                            /* to the client, qualification set after recordExit */
+                }
+                v->save.cr0 = cr0;
+                v->save.rip = v->control.nextRip;
+                if (v->control.exitIntInfo & (1u << 31)) {
+                    v->control.eventInj    = v->control.exitIntInfo;
+                    v->control.eventInjErr = v->control.exitIntInfoErr;
+                }
+                {
+                    static volatile SInt32 crLogged;
+                    if (OSIncrementAtomic(&crLogged) < 5)
+                        RHV_INFO("vCPU %u: %s completed in the kernel (no VMX exit for this CR0 mask), cr0 now 0x%llx", fIndex,
+                                 op == 1 ? "CLTS" : "LMSW", (unsigned long long)cr0);
+                }
+                if (mach_absolute_time() >= deadline && !injectionWaiting()) {
+                    timeslice = true;
+                    takePendingEvent();
+                    break;
+                }
+                continue;
+            }
+            static volatile SInt32 crUnknown;
+            if (OSIncrementAtomic(&crUnknown) < 5)
+                RHV_WARN("vCPU %u: CR0 write without an operand at rip 0x%llx could not be decoded, reported as MOV from RAX", fIndex,
+                         (unsigned long long)v->save.rip);
+        }
+
         /* First touch of a chunk of lazy guest RAM: the client never sees it. The page tables are still held for reading here. */
         if (code == EXIT_NPF && fShared->lazyCandidate(v->control.exitInfo2)) {
             /*
@@ -2072,6 +2134,8 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 if (!fVmcs.recordExit(perm)) {
                     vmxTranslated = false;
                     out->reason = RHV_EXIT_UNHANDLED;
+                } else if (fCrQual != ~0ull) {
+                    fVmcs.setQualification(fCrQual);   /* CLTS / LMSW, decoded in the run loop */
                 }      /* e.g. the guest executed an SVM instruction */
             }
             RHV_TRACE("VM exit: code=0x%llx info1=0x%llx info2=0x%llx rip=0x%llx",
@@ -2100,7 +2164,8 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
  * exctrace: the guest's code at a linear address, read through its own page tables (4-level long mode, or no paging) and the nested
  * ones. Called in the run loop, which holds the page tables for reading. Returns how many bytes it read (up to 16, not past the page).
  */
-static uint8_t fetchGuestCode(com_overlorddev_RyzenHVVmShared *sh, const Vmcb *v, uint64_t lin, uint8_t *out)
+/* Up to `want` (<= 255) bytes at a guest linear address, not past its page. */
+static uint8_t readGuestLinear(com_overlorddev_RyzenHVVmShared *sh, const Vmcb *v, uint64_t lin, uint8_t *out, size_t want)
 {
     const uint64_t kAddr = 0x000FFFFFFFFFF000ull;
     uint64_t pa = lin;
@@ -2125,11 +2190,149 @@ static uint8_t fetchGuestCode(com_overlorddev_RyzenHVVmShared *sh, const Vmcb *v
         if (!ok)
             return 0;
     }
-    size_t n = 16;
+    size_t n = want > 255 ? 255 : want;
     const size_t toPage = 4096 - (size_t)(pa & 0xFFF);
     if (n > toPage)
         n = toPage;
     return sh->readPhysLocked(pa, out, n) == kIOReturnSuccess ? (uint8_t)n : 0;
+}
+
+static uint8_t fetchGuestCode(com_overlorddev_RyzenHVVmShared *sh, const Vmcb *v, uint64_t lin, uint8_t *out)
+{
+    return readGuestLinear(sh, v, lin, out, 16);
+}
+
+uint64_t com_overlorddev_RyzenHVVm::gpr(unsigned i) const
+{
+    const Vmcb *v = (const Vmcb *)fVmcb.va;
+    switch (i & 15) {
+    case 0:  return v->save.rax;
+    case 1:  return fGprs.rcx;
+    case 2:  return fGprs.rdx;
+    case 3:  return fGprs.rbx;
+    case 4:  return v->save.rsp;
+    case 5:  return fGprs.rbp;
+    case 6:  return fGprs.rsi;
+    case 7:  return fGprs.rdi;
+    case 8:  return fGprs.r8;
+    case 9:  return fGprs.r9;
+    case 10: return fGprs.r10;
+    case 11: return fGprs.r11;
+    case 12: return fGprs.r12;
+    case 13: return fGprs.r13;
+    case 14: return fGprs.r14;
+    default: return fGprs.r15;
+    }
+}
+
+/*
+ * A CR0 write intercept whose EXITINFO1 has no decode-assist operand (bit 63 clear) is CLTS (0F 06) or LMSW (0F 01 /6). Reads the
+ * instruction at RIP (run loop: the page tables are held for reading) and, for LMSW, its 16-bit source (a register, or memory with
+ * 32- or 64-bit addressing; 16-bit addressing is not decoded). Returns 0 when it cannot tell, 1 for CLTS, 2 for LMSW.
+ */
+int com_overlorddev_RyzenHVVm::decodeCr0Op(uint16_t *src, bool *mem)
+{
+    const Vmcb *v = (const Vmcb *)fVmcb.va;
+    const bool lma = (v->save.efer & (1ull << 10)) != 0;
+    const bool code64 = lma && (v->save.cs.attrib & (1u << 9));
+    const bool d32 = (v->save.cs.attrib & (1u << 10)) != 0;
+    const uint64_t lin = code64 ? v->save.rip : ((v->save.cs.base + v->save.rip) & 0xFFFFFFFFull);
+    uint8_t b[15];
+    const uint8_t n = readGuestLinear(fShared, v, lin, b, sizeof(b));
+    if (n < 2)
+        return 0;
+    unsigned i = 0, rex = 0, seg = 0xFF;            /* seg: 0 ES 1 CS 2 SS 3 DS 4 FS 5 GS, 0xFF none */
+    bool a67 = false;
+    for (; i < n; i++) {
+        const uint8_t c = b[i];
+        if (c == 0x66 || c == 0xF0 || c == 0xF2 || c == 0xF3) continue;
+        if (c == 0x67) { a67 = true; continue; }
+        if (c == 0x26) { seg = 0; continue; }
+        if (c == 0x2E) { seg = 1; continue; }
+        if (c == 0x36) { seg = 2; continue; }
+        if (c == 0x3E) { seg = 3; continue; }
+        if (c == 0x64) { seg = 4; continue; }
+        if (c == 0x65) { seg = 5; continue; }
+        break;
+    }
+    if (code64 && i < n && (b[i] & 0xF0) == 0x40)
+        rex = b[i++];
+    if (i + 1 >= n || b[i] != 0x0F)
+        return 0;
+    if (b[i + 1] == 0x06) {
+        *src = 0;
+        *mem = false;
+        return 1;
+    }
+    if (b[i + 1] != 0x01 || i + 2 >= n)
+        return 0;
+    const uint8_t modrm = b[i + 2];
+    const unsigned mod = modrm >> 6, reg = (modrm >> 3) & 7, rm = modrm & 7;
+    if (reg != 6)
+        return 0;
+    unsigned at = i + 3;
+    if (mod == 3) {
+        *src = (uint16_t)gpr(rm | ((rex & 1) << 3));
+        *mem = false;
+        return 2;
+    }
+    const unsigned asize = code64 ? (a67 ? 32 : 64) : ((d32 != a67) ? 32 : 16);
+    if (asize == 16)
+        return 0;
+    uint64_t ea = 0;
+    bool stackBase = false;
+    if (rm == 4) {                                   /* SIB */
+        if (at >= n)
+            return 0;
+        const uint8_t sib = b[at++];
+        const unsigned scale = sib >> 6, idx = ((sib >> 3) & 7) | ((rex & 2) << 2), base = (sib & 7) | ((rex & 1) << 3);
+        if (idx != 4)
+            ea += gpr(idx) << scale;
+        if ((base & 7) == 5 && mod == 0) {
+            if (at + 4 > n) return 0;
+            int32_t d; memcpy(&d, b + at, 4); at += 4;
+            ea += (uint64_t)(int64_t)d;
+        } else {
+            ea += gpr(base);
+            stackBase = (base & 7) == 4 || (base & 7) == 5;
+        }
+    } else if (rm == 5 && mod == 0) {                /* RIP-relative (64-bit) or disp32 */
+        if (at + 4 > n) return 0;
+        int32_t d; memcpy(&d, b + at, 4); at += 4;
+        ea = (uint64_t)(int64_t)d;
+        if (code64) {                                /* relative to the next instruction */
+            if (!v->control.nextRip)
+                return 0;
+            ea += v->control.nextRip;
+        }
+    } else {
+        ea = gpr(rm | ((rex & 1) << 3));
+        stackBase = rm == 5;
+    }
+    if (mod == 1) {
+        if (at + 1 > n) return 0;
+        ea += (uint64_t)(int64_t)(int8_t)b[at];
+    } else if (mod == 2) {
+        if (at + 4 > n) return 0;
+        int32_t d; memcpy(&d, b + at, 4);
+        ea += (uint64_t)(int64_t)d;
+    }
+    if (asize == 32)
+        ea &= 0xFFFFFFFFull;
+    if (seg == 0xFF)
+        seg = stackBase ? 2 : 3;
+    const rhv::vmcb::Seg *segs[6] = { &v->save.es, &v->save.cs, &v->save.ss, &v->save.ds, &v->save.fs, &v->save.gs };
+    uint64_t addr;
+    if (code64)
+        addr = ea + ((seg == 4 || seg == 5) ? segs[seg]->base : 0);
+    else
+        addr = (segs[seg]->base + ea) & 0xFFFFFFFFull;
+    uint8_t w[2];
+    if (readGuestLinear(fShared, v, addr, w, 2) != 2)
+        return 0;                                    /* crosses a page or not mapped: leave it to the old path */
+    *src = (uint16_t)(w[0] | (w[1] << 8));
+    *mem = true;
+    return 2;
 }
 
 void com_overlorddev_RyzenHVVm::traceException(unsigned vec)
