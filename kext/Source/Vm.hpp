@@ -281,6 +281,8 @@ private:
     uint32_t                  fTraceAdded;       /* exception intercepts the trace added to the client's bitmap for this run */
     uint32_t                  fTraceSkip;        /* vectors the next VMRUN lets the CPU deliver itself (just traced) */
     uint64_t                  fTraceLastRip;     /* the code bytes are read again only when the rip changes */
+    uint64_t                  fTraceSkipRip;     /* rip of the exception fTraceSkip lets through */
+    bool                      fTraceReplay;      /* that VMRUN left before the guest moved: the next record there is a replay */
     void                      traceException(unsigned vec);
     bool                      fTlbFlushPending;
     void                      profFlush();

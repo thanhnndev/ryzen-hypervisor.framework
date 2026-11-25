@@ -60,6 +60,8 @@ struct ExcRec {
     uint32_t seq, vm, vcpu, vec, err, intInfo, intErr;
     uint16_t cs;
     uint8_t  cpl, nbytes;
+    uint8_t  replay;                 /* 1: the VMRUN that should have let the CPU deliver the last one left at once, rip unchanged (host
+                                      * interrupt, NMI or nested page fault): most likely the same fault seen again, not a new one */
     uint64_t rip, rsp, rflags, info2, cr0, cr2, cr3;
     uint8_t  bytes[16];
 };
@@ -67,6 +69,7 @@ constexpr unsigned kExcN = 1024;                   /* a power of two */
 ExcRec gExcRing[kExcN];
 volatile SInt32 gExcPos = 0;                       /* records written so far */
 volatile SInt32 gExcCount[32];                     /* per vector, since the trace was last switched on */
+volatile SInt32 gExcReplays;                       /* records with replay = 1 (counted in gExcCount too) */
 
 static_assert(RHV_GUEST_RAM_SIZE % 4096 == 0, "guest RAM must be page sized");
 static_assert((int)RHV_MEM_READ == (int)rhv::npt::PERM_R && (int)RHV_MEM_WRITE == (int)rhv::npt::PERM_W &&
@@ -1002,6 +1005,7 @@ bool set(uint64_t mask)
         return false;
     if (mask && !gExcTrace) {               /* switched on: a fresh ring and fresh counts */
         gExcPos = 0;
+        gExcReplays = 0;
         bzero((void *)gExcCount, sizeof(gExcCount));
     }
     gExcTrace = (uint32_t)mask;
@@ -1014,6 +1018,7 @@ uint32_t get() { return gExcTrace; }
 void dump(uint32_t n)
 {
     const uint32_t total = (uint32_t)gExcPos;
+    RHV_INFO("exctrace: %d of them replays (the CPU had no chance to deliver the one before, rip unchanged)", (int)gExcReplays);
     RHV_INFO("exctrace: mask 0x%x, %u recorded; per vector: #UD %d #NM %d #TS %d #NP %d #SS %d #GP %d #PF %d #AC %d", (unsigned)gExcTrace, total,
              (int)gExcCount[6], (int)gExcCount[7], (int)gExcCount[10], (int)gExcCount[11], (int)gExcCount[12],
              (int)gExcCount[13], (int)gExcCount[14], (int)gExcCount[17]);
@@ -1021,20 +1026,26 @@ void dump(uint32_t n)
         n = kExcN;
     if (n > total)
         n = total;
-    RHV_INFO("exctrace: the newest %u, oldest first (seq vm vcpu vector err exitintinfo/err rip rsp rflags info2(#PF address) cr0 cr2 cr3 cs cpl code)", n);
+    RHV_INFO("exctrace: the newest %u, oldest first, two lines each (seq vm vcpu vector err exitintinfo/err rip rsp rflags info2(#PF address) "
+             "cr0 cr2 cr3 cs cpl; then R = replay, and the code bytes at rip)", n);
     for (uint32_t i = total - n; i < total; i++) {
-        const ExcRec r = gExcRing[i & (kExcN - 1)];
-        if (r.seq != i + 1)
+        const volatile ExcRec *slot = &gExcRing[i & (kExcN - 1)];
+        if (slot->seq != i + 1)
+            continue;                        /* overwritten before reading */
+        ExcRec r;
+        memcpy(&r, (const void *)slot, sizeof(r));
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (r.seq != i + 1 || slot->seq != i + 1)
             continue;                        /* overwritten while reading */
         char b[16 * 3 + 1];
         unsigned k = 0;
         for (unsigned j = 0; j < r.nbytes && j < 16; j++)
             k += (unsigned)snprintf(b + k, sizeof(b) - k, "%02x ", r.bytes[j]);
         b[k] = 0;
-        RHV_INFO("x%u vm%u v%u #%u err %x ii %x/%x ip %llx sp %llx fl %llx i2 %llx cr0 %llx cr2 %llx cr3 %llx cs %x c%u: %s", r.seq, r.vm, r.vcpu, r.vec,
+        RHV_INFO("x%u vm%u v%u #%u err %x ii %x/%x ip %llx sp %llx fl %llx i2 %llx cr0 %llx cr2 %llx cr3 %llx cs %x c%u", r.seq, r.vm, r.vcpu, r.vec,
                  r.err, r.intInfo, r.intErr, (unsigned long long)r.rip, (unsigned long long)r.rsp, (unsigned long long)r.rflags,
-                 (unsigned long long)r.info2, (unsigned long long)r.cr0, (unsigned long long)r.cr2, (unsigned long long)r.cr3, r.cs, r.cpl,
-                 r.nbytes ? b : "(code not read)");
+                 (unsigned long long)r.info2, (unsigned long long)r.cr0, (unsigned long long)r.cr2, (unsigned long long)r.cr3, r.cs, r.cpl);
+        RHV_INFO("x%u%s code: %s", r.seq, r.replay ? " R" : "", r.nbytes ? b : "(not read)");
     }
 }
 } // namespace exctrace
@@ -1237,6 +1248,8 @@ bool com_overlorddev_RyzenHVVm::init()
     fTraceAdded = 0;
     fTraceSkip = 0;
     fTraceLastRip = ~0ull;
+    fTraceSkipRip = 0;
+    fTraceReplay = false;
     fTlbFlushPending = true;
     {
         /* Where each field runEx reports lives, worked out once instead of after every exit. */
@@ -1804,8 +1817,15 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         const uint64_t tGuest1 = __builtin_ia32_rdtsc();
         fRunCpu = -1;
         fSnap.take(v, runCpu);                /* before anything writes the VMCB again */
-        if (fTraceSkip)
-            fTraceSkip = 0;                   /* exctrace: the CPU had its chance to deliver them; intercepted again from the next VMRUN */
+        if (fTraceSkip) {                     /* exctrace: the CPU had its chance to deliver them; intercepted again from the next VMRUN */
+            /* Unless this VMRUN left before the guest moved (host interrupt, NMI, nested page fault at the same rip): then the next
+             * record of that rip is most likely the same fault again; it is marked as a replay instead of being counted as new. */
+            const uint64_t c = v->control.exitCode;
+            fTraceReplay = (c == EXIT_INTR || c == EXIT_NMI || c == EXIT_NPF) && v->save.rip == fTraceSkipRip;
+            fTraceSkip = 0;
+        } else if (fTraceReplay && !(v->control.exitCode >= 0x40 && v->control.exitCode <= 0x5F)) {
+            fTraceReplay = false;             /* the guest ran on without a traced exception */
+        }
 
         if (fVmx && fHasTscAux) {
             const uint64_t g = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);
@@ -1903,6 +1923,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             const unsigned vec = (unsigned)(code - 0x40);
             traceException(vec);
             fTraceSkip |= 1u << vec;
+            fTraceSkipRip = v->save.rip;
             const uint32_t ii = v->control.exitIntInfo;
             const uint32_t type = (ii >> 8) & 7, iv = ii & 0xFF;
             const bool softEvent = type == 4 || (type == 3 && (iv == 3 || iv == 4));
@@ -2122,7 +2143,7 @@ void com_overlorddev_RyzenHVVm::traceException(unsigned vec)
     r.vm      = (uint32_t)fShared->id();
     r.vcpu    = fIndex;
     r.vec     = vec;
-    r.err     = (uint32_t)v->control.exitInfo1;
+    r.err     = ((vec >= 10 && vec <= 14) || vec == 17) ? (uint32_t)v->control.exitInfo1 : 0;   /* only vectors with an error code */
     r.info2   = v->control.exitInfo2;
     r.intInfo = v->control.exitIntInfo;
     r.intErr  = v->control.exitIntInfoErr;
@@ -2135,9 +2156,17 @@ void com_overlorddev_RyzenHVVm::traceException(unsigned vec)
     r.cs      = v->save.cs.selector;
     r.cpl     = v->save.cpl;
     /* The code bytes cost a page walk: read them when the rip changes (a loop on one instruction is read once), and every 256th record. */
-    const bool longMode = (v->save.efer & (1ull << 10)) != 0;
-    const uint64_t lin = longMode ? v->save.rip : ((v->save.cs.base + v->save.rip) & 0xFFFFFFFFull);
-    if (lin != fTraceLastRip || (r.seq & 255) == 0) {
+    if (fTraceReplay && v->save.rip == fTraceSkipRip) {
+        r.replay = 1;
+        OSIncrementAtomic(&gExcReplays);
+    }
+    fTraceReplay = false;
+    /* 64-bit code (EFER.LMA and CS.L): rip is the linear address and must be canonical. Otherwise (compatibility mode, legacy modes)
+     * it is CS.base + EIP, 32 bits. */
+    const bool code64 = (v->save.efer & (1ull << 10)) && (v->save.cs.attrib & (1u << 9));
+    const uint64_t lin = code64 ? v->save.rip : ((v->save.cs.base + v->save.rip) & 0xFFFFFFFFull);
+    const bool canonical = !code64 || (uint64_t)((int64_t)(lin << 16) >> 16) == lin;
+    if (canonical && (lin != fTraceLastRip || (r.seq & 255) == 0)) {
         fTraceLastRip = lin;
         r.nbytes = fetchGuestCode(fShared, v, lin, r.bytes);
     }
