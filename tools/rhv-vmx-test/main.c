@@ -12,6 +12,9 @@
  *   2  the phase 1 guest (prints a string with OUT, CPUID, HLT) seen as VMX exits: reasons 30, 10, 12
  *   3  an access to an unmapped page is an EPT violation (reason 48) with the guest-physical address, the client
  *      maps the page and the guest continues
+ *   4  CLTS and LMSW (register and memory operands) in 32-bit protected mode under a QEMU-like, a HyperKit-like and a
+ *      masking CR0 guest/host mask: no exit and the right CR0 where VMX would not exit, and where it would, a CR access
+ *      exit (reason 28) with the SDM qualification and instruction length; the read shadow is never touched
  *
  * Needs root and a kext booted with rhv_enable_svm=1:
  *     sudo ./build/rhv-vmx-test
@@ -36,6 +39,7 @@ enum {
     VMCS_GUEST_CR0 = 0x6800, VMCS_GUEST_CR3 = 0x6802, VMCS_GUEST_CR4 = 0x6804,
     VMCS_GUEST_RSP = 0x681c, VMCS_GUEST_RIP = 0x681e, VMCS_GUEST_RFLAGS = 0x6820,
     VMCS_GUEST_IA32_EFER = 0x2806,
+    VMCS_CTRL_CR0_MASK = 0x6000, VMCS_CTRL_CR0_SHADOW = 0x6004,
     VMCS_CTRL_CPU_BASED = 0x4002, VMCS_CTRL_EXC_BITMAP = 0x4004,
     VMCS_RO_EXIT_REASON = 0x4402, VMCS_RO_INSTR_LEN = 0x440c, VMCS_RO_EXIT_QUALIFIC = 0x6400,
     VMCS_GUEST_PHYSICAL_ADDRESS = 0x2400
@@ -46,6 +50,7 @@ enum {
 /* Intel exit reasons. */
 #define EXIT_CPUID 10
 #define EXIT_HLT 12
+#define EXIT_CR_ACCESS 28
 #define EXIT_IO 30
 #define EXIT_EPT_VIOLATION 48
 
@@ -159,6 +164,159 @@ static const uint8_t kProg2[] = {
     0xC6, 0x06, 0x20, 0x10, 0x42,       /* mov byte [0x1020], 0x42  */
     0xF4,                               /* hlt                      */
 };
+
+/* ---- Stage 4: CLTS / LMSW under the client's CR0 mask (SDM Vol. 3, "Changes to instruction behavior in VMX non-root") ---- */
+
+/* 32-bit flat protected mode, no paging: LMSW with a memory operand needs 32-bit addressing to be decoded. */
+static void program_prot32(uint32_t ip, uint64_t cr0)
+{
+    static const uint32_t sel[] = { VMCS_GUEST_ES, VMCS_GUEST_CS, VMCS_GUEST_SS, VMCS_GUEST_DS, VMCS_GUEST_FS,
+                                    VMCS_GUEST_GS, VMCS_GUEST_LDTR, VMCS_GUEST_TR };
+    for (int i = 0; i < 8; i++) {
+        const int flat = i < 6;
+        vmcs_write(sel[i], i == 1 ? 0x08 : flat ? 0x10 : 0);
+        vmcs_write(VMCS_GUEST_ES_LIMIT + 2 * i, flat ? 0xFFFFFFFFu : 0xFFFF);
+        vmcs_write(VMCS_GUEST_ES_BASE + 2 * i, 0);
+        uint32_t ar = i == 1 ? 0xC09B : i == 6 ? 0x82 : i == 7 ? 0x8B : 0xC093;   /* CS 32-bit code, LDTR, TR, data */
+        vmcs_write(VMCS_GUEST_ES_AR + 2 * i, ar);
+    }
+    vmcs_write(VMCS_GUEST_GDTR_BASE, 0);
+    vmcs_write(VMCS_GUEST_GDTR_LIMIT, 0xFFFF);
+    vmcs_write(VMCS_GUEST_IDTR_BASE, 0);
+    vmcs_write(VMCS_GUEST_IDTR_LIMIT, 0xFFFF);
+    vmcs_write(VMCS_GUEST_CR0, cr0);
+    vmcs_write(VMCS_GUEST_CR3, 0);
+    vmcs_write(VMCS_GUEST_CR4, 0);
+    vmcs_write(VMCS_GUEST_RSP, 0x8000);
+    vmcs_write(VMCS_GUEST_RFLAGS, 2);
+    vmcs_write(VMCS_GUEST_IA32_EFER, 0);
+    vmcs_write(VMCS_GUEST_RIP, ip);
+    vmcs_write(VMCS_CTRL_CPU_BASED, CPU_HLT_EXIT | CPU_IO_EXIT);
+    vmcs_write(VMCS_CTRL_EXC_BITMAP, 0);
+}
+
+#define CR_CODE 0x2000u
+#define CR_DATA 0x2100u
+#define TS 0x8u
+
+enum { OP_CLTS, OP_LMSW_REG, OP_LMSW_DISP32, OP_LMSW_BASE_DISP8 };
+
+struct CrCase {
+    const char *name;
+    int op;
+    uint16_t src;          /* LMSW source: AX, or the word in memory */
+    uint64_t cr0, mask, shadow;
+    int exits;             /* VMX would exit: reason 28 to the client */
+    uint64_t qual;         /* expected qualification when it exits */
+    uint64_t cr0After;     /* expected guest CR0 when it does not exit (unchanged when it does) */
+};
+
+/* QEMU-HVF masks CD|NE (macvm_set_cr0), HyperKit NW|CD|NE (its CR0 ones/zeros masks): neither masks PE/MP/EM/TS, so
+ * CLTS and LMSW never exit for them on Intel. The masking cases are what a client that owns TS (lazy FPU) would see. */
+#define MASK_QEMU     0x40000020ull
+#define MASK_HYPERKIT 0x60000020ull
+#define MASK_ALL      0x6000002Full   /* PE MP EM TS NE CD NW */
+#define MASK_TS       0x60000028ull
+
+static const struct CrCase kCrCases[] = {
+    { "QEMU mask: CLTS clears TS",                     OP_CLTS,            0,      0x39, MASK_QEMU,     0x39, 0, 0, 0x31 },
+    { "QEMU mask: LMSW AX=3 sets MP",                   OP_LMSW_REG,        0x0003, 0x31, MASK_QEMU,     0x31, 0, 0, 0x33 },
+    { "QEMU mask: LMSW AX=0 clears MP/TS, keeps PE",    OP_LMSW_REG,        0x0000, 0x3B, MASK_QEMU,     0x3B, 0, 0, 0x31 },
+    { "QEMU mask: LMSW [disp32]=0xB",                   OP_LMSW_DISP32,     0x000B, 0x31, MASK_QEMU,     0x31, 0, 0, 0x3B },
+    { "QEMU mask: LMSW [ebx+2]=5",                      OP_LMSW_BASE_DISP8, 0x0005, 0x31, MASK_QEMU,     0x31, 0, 0, 0x35 },
+    { "HyperKit mask: CLTS clears TS",                  OP_CLTS,            0,      0x39, MASK_HYPERKIT, 0x39, 0, 0, 0x31 },
+    { "HyperKit mask: LMSW [disp32]=0xE",               OP_LMSW_DISP32,     0x000E, 0x31, MASK_HYPERKIT, 0x31, 0, 0, 0x3F },
+    { "TS masked, shadow TS=1: CLTS exits",             OP_CLTS,            0,      0x39, MASK_ALL,      0x39, 1, 0x20, 0x39 },
+    { "TS masked, shadow TS=0: CLTS completes, TS kept", OP_CLTS,           0,      0x39, MASK_ALL,      0x31, 0, 0, 0x39 },
+    { "all masked: LMSW AX=1 differs from shadow: exits", OP_LMSW_REG,      0x0001, 0x39, MASK_ALL,      0x39, 1, 0x10030, 0x39 },
+    { "all masked: LMSW [disp32]=1: exits, memory bit", OP_LMSW_DISP32,     0x0001, 0x39, MASK_ALL,      0x39, 1, 0x10070, 0x39 },
+    { "all masked: LMSW AX=9 equals shadow: completes", OP_LMSW_REG,        0x0009, 0x39, MASK_ALL,      0x39, 0, 0, 0x39 },
+    { "TS masked: LMSW AX=3 sets MP, TS kept",          OP_LMSW_REG,        0x0003, 0x39, MASK_TS,       0x31, 0, 0, 0x3B },
+};
+
+/* Writes the case's code at CR_CODE (ending in HLT) and returns the length of the CLTS/LMSW instruction; *at is its address. */
+static unsigned put_cr_code(uint8_t *ram, const struct CrCase *c, uint32_t *at)
+{
+    uint8_t *p = ram + CR_CODE;
+    unsigned n = 0, len = 0;
+    switch (c->op) {
+    case OP_CLTS:
+        *at = CR_CODE;
+        p[n++] = 0x0F; p[n++] = 0x06; len = 2;
+        break;
+    case OP_LMSW_REG:                                  /* mov ax, imm16 ; lmsw ax */
+        p[n++] = 0x66; p[n++] = 0xB8; p[n++] = (uint8_t)c->src; p[n++] = (uint8_t)(c->src >> 8);
+        *at = CR_CODE + n;
+        p[n++] = 0x0F; p[n++] = 0x01; p[n++] = 0xF0; len = 3;
+        break;
+    case OP_LMSW_DISP32:                               /* lmsw [CR_DATA] */
+        *at = CR_CODE;
+        p[n++] = 0x0F; p[n++] = 0x01; p[n++] = 0x35;
+        p[n++] = (uint8_t)CR_DATA; p[n++] = (uint8_t)(CR_DATA >> 8); p[n++] = 0; p[n++] = 0; len = 7;
+        memcpy(ram + CR_DATA, &c->src, 2);
+        break;
+    case OP_LMSW_BASE_DISP8:                           /* mov ebx, CR_DATA ; lmsw [ebx+2] */
+        p[n++] = 0xBB; p[n++] = (uint8_t)CR_DATA; p[n++] = (uint8_t)(CR_DATA >> 8); p[n++] = 0; p[n++] = 0;
+        *at = CR_CODE + n;
+        p[n++] = 0x0F; p[n++] = 0x01; p[n++] = 0x73; p[n++] = 0x02; len = 4;
+        memcpy(ram + CR_DATA + 2, &c->src, 2);
+        break;
+    }
+    p[n++] = 0xF4;                                     /* hlt */
+    p[n++] = 0xEB; p[n++] = 0xFD;                      /* jmp back to hlt */
+    return len;
+}
+
+static void stage4(uint8_t *ram)
+{
+    printf("stage 4: CLTS / LMSW under the client's CR0 mask\n");
+    for (size_t i = 0; i < sizeof(kCrCases) / sizeof(kCrCases[0]); i++) {
+        const struct CrCase *c = &kCrCases[i];
+        uint64_t resetArgs[2] = { 0, CR_CODE };
+        IOConnectCallScalarMethod(conn, kRHVMethodVmReset, resetArgs, 2, NULL, NULL);
+        uint32_t at = 0;
+        const unsigned len = put_cr_code(ram, c, &at);
+        program_prot32(CR_CODE, c->cr0);
+        vmcs_write(VMCS_CTRL_CR0_MASK, c->mask);
+        vmcs_write(VMCS_CTRL_CR0_SHADOW, c->shadow);
+
+        RHVExit ex;
+        if (run_guest(&ex)) {
+            EXPECT(0, "%s: VmRun", c->name);
+            continue;
+        }
+        uint64_t reason = vmcs_read(VMCS_RO_EXIT_REASON);
+        if (c->exits) {
+            const uint64_t q = vmcs_read(VMCS_RO_EXIT_QUALIFIC);
+            const uint64_t ilen = vmcs_read(VMCS_RO_INSTR_LEN);
+            const uint64_t rip = vmcs_read(VMCS_GUEST_RIP);
+            const uint64_t cr0 = vmcs_read(VMCS_GUEST_CR0);
+            EXPECT(reason == EXIT_CR_ACCESS && q == c->qual && ilen == len && rip == at && cr0 == c->cr0,
+                   "%s: reason %" PRIu64 " (28), qual 0x%" PRIx64 " (0x%" PRIx64 "), len %" PRIu64 " (%u), rip 0x%" PRIx64
+                   " (0x%x), cr0 0x%" PRIx64 " unchanged",
+                   c->name, reason, q, c->qual, ilen, len, rip, at, cr0);
+            /* The client emulates it (here: leaves CR0 as it is) and steps over it, as QEMU would. */
+            advance_rip();
+            if (run_guest(&ex)) {
+                EXPECT(0, "%s: VmRun after the exit", c->name);
+                continue;
+            }
+            reason = vmcs_read(VMCS_RO_EXIT_REASON);
+            EXPECT(reason == EXIT_HLT, "%s: guest continues to HLT (reason %" PRIu64 ")", c->name, reason);
+        } else {
+            const uint64_t rip = vmcs_read(VMCS_GUEST_RIP);
+            const uint64_t cr0 = vmcs_read(VMCS_GUEST_CR0);
+            EXPECT(reason == EXIT_HLT && rip == at + len && (cr0 & 0xFFFFFFFFull) == c->cr0After,
+                   "%s: no exit to the client (reason %" PRIu64 ", HLT at 0x%" PRIx64 " expected 0x%x), cr0 0x%" PRIx64
+                   " (0x%" PRIx64 ")",
+                   c->name, reason, rip, at + len, cr0, c->cr0After);
+        }
+        const uint64_t sh = vmcs_read(VMCS_CTRL_CR0_SHADOW);
+        EXPECT(sh == c->shadow, "%s: read shadow untouched (0x%" PRIx64 ")", c->name, sh);
+    }
+    vmcs_write(VMCS_CTRL_CR0_MASK, 0);
+    vmcs_write(VMCS_CTRL_CR0_SHADOW, 0);
+}
 
 int main(void)
 {
@@ -274,6 +432,8 @@ int main(void)
         goto done;                                /* RIP unchanged: the faulting store is retried */
     EXPECT(vmcs_read(VMCS_RO_EXIT_REASON) == EXIT_HLT, "the guest continued to HLT (reason %" PRIu64 ")", vmcs_read(VMCS_RO_EXIT_REASON));
     EXPECT(buf[0x10] == 0x42, "the store landed in the client's page (0x%02x)", buf[0x10]);
+
+    stage4((uint8_t *)(uintptr_t)ram);
 
 done:
     IOConnectUnmapMemory64(conn, kRHVMemGuestRam, mach_task_self(), ram);
