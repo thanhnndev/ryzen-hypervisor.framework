@@ -75,6 +75,15 @@ void testStateFields()
 
     /* Width masking: a 16-bit selector and a 32-bit limit drop the high bits. */
     CHECK(f.st.write(0x0804, 0xFFFF0010) == R_OK && f.vmcb.save.ss.selector == 0x10);
+    /* CPL follows SS.DPL both ways (a vCPU state loaded in user mode, e.g. a snapshot restore). */
+    CHECK(f.st.write(0x4818, 0xC0F3) == R_OK && f.vmcb.save.cpl == 3);            /* SS AR, DPL 3 */
+    CHECK((rd(f, 0x4818) & 0x60) == 0x60);
+    f.vmcb.save.ss.attrib = 0xC93;                                                  /* SYSRET left SS.DPL 0, CPL 3 */
+    CHECK((rd(f, 0x4818) & 0x60) == 0x60);                                          /* read back as CPL */
+    CHECK(f.st.write(0x4818, 0xC093) == R_OK && f.vmcb.save.cpl == 0);
+    CHECK((rd(f, 0x4818) & 0x60) == 0);
+    CHECK(f.st.write(0x4818, 0x10000 | 0x60) == R_OK && f.vmcb.save.cpl == 3);    /* unusable SS still carries the DPL */
+    CHECK(f.st.write(0x4818, 0xC093) == R_OK && f.vmcb.save.cpl == 0);
     CHECK(f.st.write(0x4804, 0x1FFFFFFFFull) == R_OK && f.vmcb.save.ss.limit == 0xFFFFFFFF);
     /* SYSENTER_CS is 32 bits in the VMCS but a 64-bit slot in the VMCB. */
     CHECK(f.st.write(0x482a, 0xFFFFFFFF08ull) == R_OK && f.vmcb.save.sysenterCs == 0xFFFFFF08 && rd(f, 0x482a) == 0xFFFFFF08);
