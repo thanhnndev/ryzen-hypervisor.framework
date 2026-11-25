@@ -175,7 +175,7 @@ struct HvVcpu {
     RHVFpuState fpu;
     uint8_t *msrPage;          /* this vCPU's 4 KiB page in the ro area: the managed MSR list, entries of 16 bytes {msr, value} */
     uint32_t nManaged;
-    bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (HyperKit only) */
+    bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (cpuidCommonFixup; more for HyperKit, Parallels) */
     uint32_t cpuidLeaf;
     uint32_t cpuidSub;
     uint64_t cr2Page;          /* the CR2 word of the page as this driver last left it: a different value is the client's write (an injected #PF needs it) and is applied */
@@ -835,6 +835,23 @@ void parallelsCpuidFixup(HvVcpu *v)
     }
 }
 
+/*
+ * Every client, after its own CPUID answer and the client-specific clean-up above: no protection keys. The clients build CPUID from the host:
+ * leaf 7 shows PKU (Zen 5 has it), while leaf 0xD is cut down to the host thread's XCR0, which macOS keeps at x87/SSE/AVX (0x7): no PKRU
+ * state component. A guest then sets CR4.PKE but has no XSAVE slot for PKRU. Linux 6.12 (Android 37's kernel) then cannot build a signal
+ * frame: get_xsave_addr_user(PKRU) warns and returns NULL, put_user(pkru, NULL) faults into its fixup, the signal cannot be delivered and
+ * is retried forever (the emulator's black screen: init loops in the exception-table search). This kernel could not give the guest PKRU
+ * anyway: the guest's XCR0 may only hold state the host thread has enabled (Vm::run refuses anything else), and PKRU is not switched
+ * between guest and host. So hide PKU and OSPKE, and PKRU in leaf 0xD in case a client passes it.
+ */
+void cpuidCommonFixup(HvVcpu *v)
+{
+    if (v->cpuidLeaf == 7 && v->cpuidSub == 0)
+        *gprWord(v, R_RCX) &= ~((1ull << 3) | (1ull << 4));   /* PKU, OSPKE */
+    else if (v->cpuidLeaf == 0xD && v->cpuidSub == 0)
+        *gprWord(v, R_RAX) &= ~(1ull << 9);                  /* XCR0 bit 9, PKRU */
+}
+
 /* What the client changes before a run: segment registers and their bases/rights, RIP/RSP/RFLAGS and the MSRs that carry the GS state. Called only with the recording on. */
 inline void dbgNoteWrite(unsigned vcpu, uint64_t id, uint64_t val)
 {
@@ -985,10 +1002,8 @@ static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg)
     /* HyperKit answers CPUID from the host's values, which on a Ryzen are AMD's; a Linux guest then trusts features HyperKit does not emulate
      * (MWAITX in its delay loop, SVM, extended topology, AMD counters, IBPB/IBRS/SSBD enumeration). Clean the answer it just wrote. */
     if (v->cpuidPending && v->vm->parallels) {
-        v->cpuidPending = false;
         parallelsCpuidFixup(v);
-    } else if (v->cpuidPending) {
-        v->cpuidPending = false;
+    } else if (v->cpuidPending && v->vm->hyperkit) {
         if (v->cpuidLeaf == 0x80000001u)
             *gprWord(v, R_RCX) &= ~((1ull << 2) | (1ull << 22) | (1ull << 23) | (1ull << 24) | (1ull << 26) | (1ull << 27) | (1ull << 29));
         else if (v->cpuidLeaf == 0x80000008u)
@@ -1009,6 +1024,10 @@ static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg)
             *gprWord(v, R_RCX) = 0;
             *gprWord(v, R_RDX) = 0;
         }
+    }
+    if (v->cpuidPending) {
+        v->cpuidPending = false;
+        cpuidCommonFixup(v);
     }
     RHVRegs regs;
     cpu->getRegs(&regs);
@@ -1234,7 +1253,7 @@ static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg)
                      (unsigned long long)inRdx, (unsigned long long)intr, (unsigned long long)cr0);
         }
     }
-    if (v->vm->hyperkit || v->vm->parallels) {
+    {                                                   /* every client: its CPUID answer is cleaned on the way back in */
         uint64_t exitReason = 0;
         for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++)
             if (kRunFields[i] == 0x4402)
