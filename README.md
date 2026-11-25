@@ -1,5 +1,11 @@
 # RyzenHV
 
+> **This branch is the GA403WM fork** ([thanhnndev/ryzen-hypervisor.framework](https://github.com/thanhnndev/ryzen-hypervisor.framework)),
+> not an upstream release. It adds Docker Desktop on Zen 5 / macOS 26, lazy guest RAM and the Android emulator fix
+> (versions 0.7.11 to 0.7.24 are the fork's own numbers). Every change in the fork was written by an AI (Claude) and
+> tested on one laptop. Notes: [docs/release-notes/v0.7.24-ga403wm.md](docs/release-notes/v0.7.24-ga403wm.md).
+> Everything below this box is upstream's README and describes upstream's machine. Report fork bugs to the fork.
+
 Virtual machines and Docker on a **Hackintosh with an AMD Ryzen**.
 
 On an Intel Mac, Docker Desktop, Parallels, VirtualBox and QEMU use Apple's `Hypervisor.framework`, which is built on Intel's VT-x. On a Ryzen it
@@ -159,6 +165,16 @@ app/                      the RyzenHV app (SwiftUI)
 tests/                    unit tests, run by `make test`
 docs/                     the technical documentation (architecture, native mode, debugging)
 ```
+
+## Credits (GA403WM fork)
+
+| Who | What |
+|---|---|
+| [OverlordDev (Illia Haidai)](https://github.com/OverlordDev/ryzen-hypervisor.framework) | Author of ryzen-hypervisor.framework / RyzenHV. The fork builds on it and keeps its MIT licence and copyright |
+| [suwardhana](https://github.com/OverlordDev/ryzen-hypervisor.framework/pull/11) | Upstream pull request 11 (PKU / OSPKE hidden from the guest, upstream 0.7.9): the same fix as the fork's `11ec930`, published first |
+| Docker Desktop / [HyperKit](https://github.com/moby/hyperkit), [QEMU](https://www.qemu.org) / the Android Emulator | The clients the fork's changes were made for and tested with. Not included |
+| [OpenCore](https://github.com/acidanthera/OpenCorePkg) (acidanthera) | The boot loader that injects the kext |
+| [Claude](https://claude.com/claude-code) (Anthropic) | Wrote every change in the fork, directed and tested by thanhnndev |
 
 ## License
 
