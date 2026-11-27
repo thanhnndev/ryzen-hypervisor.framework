@@ -131,6 +131,10 @@ static int cmd_stats(io_connect_t conn)
     size_t outSize = sizeof(s);
     kern_return_t kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
     if (kr != KERN_SUCCESS) {                    /* an older kext has a shorter struct (each layout is a prefix of the next) */
+        outSize = RHV_STATS_SIZE_V5;
+        kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
+    }
+    if (kr != KERN_SUCCESS) {
         outSize = RHV_STATS_SIZE_V4;
         kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
     }
@@ -146,7 +150,7 @@ static int cmd_stats(io_connect_t conn)
         outSize = RHV_STATS_SIZE_V1;
         kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
     }
-    if (kr != KERN_SUCCESS || (outSize != sizeof(s) && outSize != RHV_STATS_SIZE_V4 && outSize != RHV_STATS_SIZE_V3 && outSize != RHV_STATS_SIZE_V2 && outSize != RHV_STATS_SIZE_V1)) {
+    if (kr != KERN_SUCCESS || (outSize != sizeof(s) && outSize != RHV_STATS_SIZE_V5 && outSize != RHV_STATS_SIZE_V4 && outSize != RHV_STATS_SIZE_V3 && outSize != RHV_STATS_SIZE_V2 && outSize != RHV_STATS_SIZE_V1)) {
         fprintf(stderr, "GetStats failed: 0x%x (size %zu, expected %zu)\n", kr, outSize, sizeof(s));
         return 1;
     }
@@ -195,13 +199,33 @@ static int cmd_stats(io_connect_t conn)
             P(vmTlbFlushes);
             P(vmAsidNew);
         }
-        if (outSize >= RHV_STATS_SIZE) {
+        if (outSize >= RHV_STATS_SIZE_V5) {
             P(vmLazyFaults);
             P(vmLazyRefaults);
             P(vmLazyRefaultCyc);
             P(vmReclaimScans);
             P(vmReclaimScanned);
             P(vmReclaimEvicted);
+        }
+        if (outSize >= RHV_STATS_SIZE) {
+            /* one "  name : value" line per counter, so scripts can parse them like the others */
+            static const char *const kExitNames[RHV_EXITC_COUNT] = {"Intr", "Nmi", "Vintr", "Cr", "Dr", "Excp", "Cpuid", "Hlt",
+                                                                    "Io", "Rdmsr", "Wrmsr", "Npf", "Pause", "SvmInsn", "Other",
+                                                                    "Timeslice"};
+            static const char *const kApicNames[RHV_APICR_COUNT] = {"Eoi", "Icr", "Tmict", "Other"};
+            char name[32];
+            for (unsigned i = 0; i < RHV_EXITC_COUNT; i++) {
+                snprintf(name, sizeof(name), "exitAll%s", kExitNames[i]);
+                printf("  %-16s: %llu\n", name, (unsigned long long)s.vmExitAll[i]);
+            }
+            for (unsigned i = 0; i < RHV_EXITC_COUNT; i++) {
+                snprintf(name, sizeof(name), "exitOut%s", kExitNames[i]);
+                printf("  %-16s: %llu\n", name, (unsigned long long)s.vmExitOut[i]);
+            }
+            for (unsigned i = 0; i < RHV_APICR_COUNT; i++) {
+                snprintf(name, sizeof(name), "apicNpf%s", kApicNames[i]);
+                printf("  %-16s: %llu\n", name, (unsigned long long)s.vmApicNpf[i]);
+            }
         }
         if (s.vmTraps && s.vmProfExits) {
             /* per hv_vcpu_run trap and per VMRUN, in microseconds at the TSC rate */
@@ -220,7 +244,7 @@ static int cmd_stats(io_connect_t conn)
             if (outSize >= RHV_STATS_SIZE_V4)
                 printf("  guest TLB       : flushed on %.1f%% of VMRUNs, new ASID on %.1f%%\n", 100.0 * s.vmTlbFlushes / s.vmProfExits,
                        100.0 * s.vmAsidNew / s.vmProfExits);
-            if (outSize >= RHV_STATS_SIZE)
+            if (outSize >= RHV_STATS_SIZE_V5)
                 printf("  lazy RAM        : %.0f MiB wired now, %llu chunk faults, %llu re-faults (%.1f us each), %llu of %llu scanned chunks unwired\n",
                        s.vmPagesMapped * 4096.0 / 1048576.0, (unsigned long long)s.vmLazyFaults, (unsigned long long)s.vmLazyRefaults,
                        s.vmLazyRefaults ? s.vmLazyRefaultCyc * us / s.vmLazyRefaults : 0.0, (unsigned long long)s.vmReclaimEvicted,

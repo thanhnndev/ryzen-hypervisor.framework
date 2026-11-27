@@ -10,6 +10,7 @@
 #include "SVM.hpp"
 #include "Vm.hpp"
 #include "VmcbCache.hpp"
+#include "ExitClass.hpp"
 
 static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
 
@@ -1239,6 +1240,9 @@ bool com_overlorddev_RyzenHVVm::init()
     fFirstRun    = true;
     fHaveNextRip = false;
     bzero(fProf, sizeof(fProf));
+    bzero(fExitAll, sizeof(fExitAll));
+    bzero(fExitOut, sizeof(fExitOut));
+    bzero(fApicNpf, sizeof(fApicNpf));
     fFpuCheckCount = 0;
     fSnap.forget();
     fAsid.gen = 0; fAsid.asid = 0; fAsid.cpu = -1;
@@ -1269,6 +1273,7 @@ bool com_overlorddev_RyzenHVVm::init()
 
 void com_overlorddev_RyzenHVVm::free()
 {
+    profFlush();                      /* the last partial batch (< kProfFlush exits) would be lost otherwise */
     if (fShared) {
         if (fIndex != ~0u)
             fShared->detach(this);
@@ -1522,7 +1527,19 @@ void com_overlorddev_RyzenHVVm::profFlush()
     RHV_STAT_ADD(vmCycFeOut, fProf[kProfFeOut]);
     RHV_STAT_ADD(vmTlbFlushes, fProf[kProfFlushes]);
     RHV_STAT_ADD(vmAsidNew, fProf[kProfAsidNew]);
+    for (unsigned i = 0; i < RHV_EXITC_COUNT; i++) {
+        if (fExitAll[i])
+            RHV_STAT_ADD(vmExitAll[i], fExitAll[i]);
+        if (fExitOut[i])
+            RHV_STAT_ADD(vmExitOut[i], fExitOut[i]);
+    }
+    for (unsigned i = 0; i < RHV_APICR_COUNT; i++)
+        if (fApicNpf[i])
+            RHV_STAT_ADD(vmApicNpf[i], fApicNpf[i]);
     bzero(fProf, sizeof(fProf));
+    bzero(fExitAll, sizeof(fExitAll));
+    bzero(fExitOut, sizeof(fExitOut));
+    bzero(fApicNpf, sizeof(fApicNpf));
 }
 
 IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
@@ -1890,6 +1907,7 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
         code = v->control.exitCode;
         RHV_STAT_INC(vmExits);
+        fExitAll[rhv::exitclass::classify(code, v->control.exitInfo1)]++;
         /* The injection was either delivered or is reported in exitIntInfo; do not let it fire a second time. */
         v->control.eventInj    = 0;
         v->control.eventInjErr = 0;
@@ -2115,13 +2133,19 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         bool vmxTranslated = false;
         bzero(out, sizeof(*out));
         if (timeslice) {
+            fExitOut[RHV_EXITC_TIMESLICE]++;
             out->reason = RHV_EXIT_TIMESLICE;
             if (fVmx)
                 fVmcs.recordSynthetic(syntheticReason ? syntheticReason : rhv::vmx::VMX_EXT_INTR, carryInfo, carryErr);
         } else {
             out->reason   = classify(code);
-            if (out->reason == RHV_EXIT_NPF)
+            fExitOut[rhv::exitclass::classify(code, v->control.exitInfo1)]++;
+            if (out->reason == RHV_EXIT_NPF) {
                 RHV_STAT_INC(vmNptFaults);
+                const unsigned reg = rhv::exitclass::apicRegister(v->control.exitInfo2);
+                if (reg < RHV_APICR_COUNT)
+                    fApicNpf[reg]++;
+            }
             out->exitCode = code;
             out->info1    = v->control.exitInfo1;
             out->info2    = v->control.exitInfo2;

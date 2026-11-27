@@ -269,6 +269,10 @@ private:
     enum { kProfTrap, kProfTraps, kProfRun, kProfPre, kProfGuest, kProfPost, kProfExits, kProfFeIn, kProfRunEx, kProfFeOut, kProfFlushes, kProfAsidNew, kProfCount };
     static const uint32_t     kProfFlush = 1024;
     uint64_t                  fProf[kProfCount];
+    /* Exit classes (RHV_EXITC_*) and xAPIC-page NPFs of this vCPU, added to rhv::gStats with fProf. */
+    uint32_t                  fExitAll[RHV_EXITC_COUNT];
+    uint32_t                  fExitOut[RHV_EXITC_COUNT];
+    uint32_t                  fApicNpf[RHV_APICR_COUNT];
     uint32_t                  fFpuCheckCount;    /* the host FPU self-check runs on one VMRUN in 64 */
     rhv::vmx::VmcsState::ReadPlan fRunPlan[RHV_RUN_NFIELDS];   /* the fields runEx reports, located once */
 

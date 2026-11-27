@@ -297,7 +297,34 @@ typedef struct RHVStats {
     uint64_t vmReclaimScans;     /* scan rounds (per VM) */
     uint64_t vmReclaimScanned;   /* mapped chunks looked at */
     uint64_t vmReclaimEvicted;   /* chunks unwired and unmapped because they were cold */
+    /* Since 0.7.27: exits by class (RHV_EXITC_*), counted per vCPU and added in the same batches as the sums above. */
+    uint64_t vmExitAll[16];      /* every #VMEXIT, also the ones the kernel handles itself */
+    uint64_t vmExitOut[16];      /* the ones handed to the client (each ends one VmRun); RHV_EXITC_TIMESLICE: kernel deadline or kick */
+    uint64_t vmApicNpf[4];       /* client NPF exits on the xAPIC page (GPA 0xFEE00000), by register: RHV_APICR_* */
 } RHVStats;
+
+/* Exit classes for RHVStats.vmExitAll / vmExitOut (from the SVM exit code). */
+enum {
+    RHV_EXITC_INTR = 0,     /* host interrupt (0x60) */
+    RHV_EXITC_NMI,          /* NMI, SMI, INIT (0x61-0x63) */
+    RHV_EXITC_VINTR,        /* interrupt window (0x64) */
+    RHV_EXITC_CR,           /* CR read/write (0x00-0x1F, 0x65 CR0 selective) */
+    RHV_EXITC_DR,           /* DR read/write (0x20-0x3F) */
+    RHV_EXITC_EXCP,         /* exception intercept (0x40-0x5F) */
+    RHV_EXITC_CPUID,        /* 0x72 */
+    RHV_EXITC_HLT,          /* 0x78 */
+    RHV_EXITC_IO,           /* 0x7B */
+    RHV_EXITC_RDMSR,        /* 0x7C, EXITINFO1 = 0 */
+    RHV_EXITC_WRMSR,        /* 0x7C, EXITINFO1 = 1 */
+    RHV_EXITC_NPF,          /* 0x400 */
+    RHV_EXITC_PAUSE,        /* 0x77 */
+    RHV_EXITC_SVMINSN,      /* VMRUN..SKINIT, VMMCALL (0x80-0x86, 0x81) */
+    RHV_EXITC_OTHER,        /* everything else, shutdown and VMEXIT_INVALID included */
+    RHV_EXITC_TIMESLICE,    /* vmExitOut only: VmRun returned for the deadline, a kick or a synthetic reason, no exit of its own */
+    RHV_EXITC_COUNT
+};
+/* xAPIC registers for RHVStats.vmApicNpf. */
+enum { RHV_APICR_EOI = 0, RHV_APICR_ICR, RHV_APICR_TMICT, RHV_APICR_OTHER, RHV_APICR_COUNT };
 
 /* Guest registers as seen by userland (VmGetRegs / VmSetRegs). */
 typedef struct RHVRegs {
@@ -423,7 +450,8 @@ typedef struct RHVLogChunk {
 /* Compile-time size checks that work in both C and C++. */
 typedef char rhv_assert_log_chunk_size[(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE) ? 1 : -1];
 /* RHVStats size. The stats call accepts exactly this size or an older one (V2, V1) and copies only what the caller asked for. */
-#define RHV_STATS_SIZE    (43 * 8)
+#define RHV_STATS_SIZE    (79 * 8)
+#define RHV_STATS_SIZE_V5 (43 * 8)   /* 0.7.23-0.7.26 */
 #define RHV_STATS_SIZE_V4 (37 * 8)   /* 0.7.22 */
 #define RHV_STATS_SIZE_V3 (35 * 8)   /* 0.7.21 */
 #define RHV_STATS_SIZE_V2 (32 * 8)   /* 0.7.18-0.7.20 */
