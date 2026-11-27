@@ -482,8 +482,48 @@ void testMapRangeFailureAccounting()
 
 } // namespace
 
+/* The leaf entry the hardware would use for `gpa` (the fake allocator's physical addresses are pointers). */
+uint64_t *leafEntry(const Table &t, uint64_t gpa)
+{
+    uint64_t table = t.rootPa();
+    for (int lvl = 4; lvl > 1; lvl--) {
+        uint64_t e = ((const uint64_t *)(uintptr_t)table)[indexAt(gpa, lvl)];
+        if (!(e & E_P))
+            return nullptr;
+        table = e & E_ADDR_MASK;
+    }
+    return &((uint64_t *)(uintptr_t)table)[indexAt(gpa, 1)];
+}
+
+void testScanAccessed()
+{
+    Fake f;
+    Table t(allocatorFor(&f));
+    CHECK(t.init());
+    const uint64_t base = 0x40000000ull;                      /* a 2 MiB block */
+    for (uint64_t i = 0; i < 300; i++)
+        CHECK(t.map(base + i * 4096, 0x9000000 + i * 4096, PERM_R | PERM_W, OWN1) == OK);
+    bool acc = true;
+    CHECK(t.scanAccessed(base, 0x200000, true, &acc) == 300 && !acc);
+    CHECK(t.scanAccessed(base + 0x200000, 0x200000, true, &acc) == 0 && !acc);   /* nothing mapped there */
+    CHECK(t.scanAccessed(base + 0x1FF000, 0x2000, true, &acc) == 0);              /* crosses a 2 MiB boundary: refused */
+    uint64_t *e = leafEntry(t, base + 17 * 4096);
+    CHECK(e != nullptr);
+    if (e) {
+        *e |= E_A | (1ull << 6);                              /* the CPU set A and D */
+        CHECK(t.scanAccessed(base, 0x200000, false, &acc) == 300 && acc);
+        CHECK((*e & E_A));                                    /* no clear asked */
+        CHECK(t.scanAccessed(base + 0x10000, 0x10000, true, &acc) == 16 && acc);   /* page 17 is in [16, 32) */
+        CHECK(!(*e & E_A) && (*e & (1ull << 6)) && (*e & E_P)); /* only A went */
+        CHECK(t.scanAccessed(base, 0x200000, true, &acc) == 300 && !acc);
+    }
+    t.shutdown(nullptr, nullptr);
+    CHECK(f.pagesLive == 0 && f.memLive == 0);
+}
+
 int main()
 {
+    testScanAccessed();
     testEncoding();
     testMapLookupUnmap();
     testErrors();

@@ -6,10 +6,11 @@
 #include "Log.hpp"
 #include "RyzenHV.hpp"
 #include "SVM.hpp"
+#include "Vm.hpp"
 
 #define super IOService
 
-#define RHV_VERSION "0.7.8"
+#define RHV_VERSION "0.7.25"
 
 OSDefineMetaClassAndStructors(com_overlorddev_RyzenHV, IOService)
 
@@ -136,6 +137,7 @@ bool com_overlorddev_RyzenHV::start(IOService *provider)
             if (n && fSelfTest) {
                 uint32_t ok, total;
                 rhv::svm::verifyAll(&ok, &total);
+                rhv::svm::checkTsc("start", nullptr);
             }
         } else {
             RHV_INFO("probe only; add boot-arg rhv_enable_svm=1 to enable SVM");
@@ -149,6 +151,7 @@ void com_overlorddev_RyzenHV::stop(IOService *provider)
 {
     RHV_INFO("stopping");
     rhv::hv::stop();
+    rhv::reclaim::stop();          /* before the VMs and SVM go: no scan may run after this */
     if (fPMNotifier) {
         fPMNotifier->remove();
         fPMNotifier = nullptr;
@@ -173,6 +176,7 @@ IOReturn com_overlorddev_RyzenHV::sleepWakeHandler(void *target, void *, UInt32 
             uint32_t ok, total;
             rhv::svm::verifyAll(&ok, &total);
         }
+        rhv::svm::scheduleTscCheck("wake");     /* a TSC-sync kext rewrites the TSC on wake: look at what it left */
         break;
     default:
         break;
@@ -191,13 +195,16 @@ void com_overlorddev_RyzenHV::getInfo(RHVInfo *out)
     *out = fInfo;
 }
 
-void com_overlorddev_RyzenHV::getStats(RHVStats *out)
+void com_overlorddev_RyzenHV::getStats(void *out, size_t size)
 {
+    static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
     rhv::gStats.logLevel = rhv::log::level();
-    *out = rhv::gStats;
+    bcopy(&rhv::gStats, out, size < sizeof(RHVStats) ? size : sizeof(RHVStats));
 }
 
 bool com_overlorddev_RyzenHV::runSelfTest(uint32_t *ok, uint32_t *total)
 {
-    return rhv::svm::verifyAll(ok, total);
+    bool r = rhv::svm::verifyAll(ok, total);
+    rhv::svm::checkTsc("selftest", nullptr);    /* the result is in `rhv-info log` */
+    return r;
 }

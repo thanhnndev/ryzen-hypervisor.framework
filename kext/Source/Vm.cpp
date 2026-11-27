@@ -1,4 +1,7 @@
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 
 #include "KernelDecls.hpp"
 #include "MsrMap.hpp"
@@ -6,6 +9,9 @@
 #include "Log.hpp"
 #include "SVM.hpp"
 #include "Vm.hpp"
+#include "VmcbCache.hpp"
+
+static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
 
 #define super OSObject
 
@@ -32,10 +38,62 @@ const uint64_t kTimesliceNs = 10ull * 1000 * 1000;   /* return to userland at le
 
 const uint64_t kGuestPat = 0x0007040600070406ull;   /* power-on default PAT */
 
+/* Each CPU's guest ASIDs (VmcbCache.hpp). Only that CPU touches its pool, with interrupts off, right before VMRUN. */
+rhv::vmcb::AsidPool gAsidPool[RHV_MAX_CPUS];
+
+/* kRHVHvCache: which of the 0.7.22 VMRUN shortcuts are in use (rhv::vmcbcache). Read before every VMRUN. */
+volatile uint32_t gVmcbCache = rhv::vmcbcache::kAll;
+/* Goes up on every change of gVmcbCache: each vCPU then forgets its clean-bit snapshot and its ASID once (all dirty, new ASID,
+ * so the next VMRUN reloads everything and starts from an empty TLB), whatever the direction of the change. */
+volatile SInt32 gVmcbCacheGen = 1;
+
+/*
+ * rhv-info hv exctrace (kRHVHvExcTrace): debugging of a guest that keeps faulting where no exit shows it. gExcTrace is a bitmap of
+ * exception vectors (rhv::exctrace::kAllowed), 0 by default; while it is 0 no intercept is added and the run loop is as before.
+ * A vCPU intercepts those vectors in addition to the client's own, records each one in gExcRing, and lets the next VMRUN run
+ * without that intercept: the guest re-executes the faulting instruction (or the event delivery it hit) and the CPU raises the
+ * exception again and delivers it itself, so error codes, CR2, RF and the nested-fault rules (#DF, triple fault) stay the CPU's.
+ * #DF itself cannot be traced (exctrace::kAllowed).
+ */
+volatile uint32_t gExcTrace = 0;
+struct ExcRec {
+    uint32_t seq, vm, vcpu, vec, err, intInfo, intErr;
+    uint16_t cs;
+    uint8_t  cpl, nbytes;
+    uint8_t  replay;                 /* 1: the VMRUN that should have let the CPU deliver the last one left at once, rip unchanged (host
+                                      * interrupt, NMI or nested page fault): most likely the same fault seen again, not a new one */
+    uint64_t rip, rsp, rflags, info2, cr0, cr2, cr3;
+    uint8_t  bytes[16];
+};
+constexpr unsigned kExcN = 1024;                   /* a power of two */
+ExcRec gExcRing[kExcN];
+volatile SInt32 gExcPos = 0;                       /* records written so far */
+volatile SInt32 gExcCount[32];                     /* per vector, since the trace was last switched on */
+volatile SInt32 gExcReplays;                       /* records with replay = 1 (counted in gExcCount too) */
+
 static_assert(RHV_GUEST_RAM_SIZE % 4096 == 0, "guest RAM must be page sized");
 static_assert((int)RHV_MEM_READ == (int)rhv::npt::PERM_R && (int)RHV_MEM_WRITE == (int)rhv::npt::PERM_W &&
                   (int)RHV_MEM_EXEC == (int)rhv::npt::PERM_X,
               "RHV_MEM_* must match the NPT permission bits");
+
+/*
+ * Lazy guest RAM (see Vm.hpp). A map of at least kLazyMinBytes is wired chunk by chunk on first touch. 2 MiB matches the
+ * guest's transparent huge pages and keeps the number of first-touch faults small (4096 for 8 GiB, once per chunk).
+ */
+const uint64_t kLazyMinBytes = 64ull << 20;
+const uint64_t kLazyChunk    = 2ull << 20;
+
+bool lazyMapEnabled()
+{
+    static volatile SInt32 state = -1;
+    if (state < 0) {
+        uint32_t v = 1;
+        if (!PE_parse_boot_argn("rhv_lazymap", &v, sizeof(v)))
+            v = 1;
+        state = v ? 1 : 0;
+    }
+    return state == 1;
+}
 
 /* Table pages are wired physically contiguous kernel pages. Node bookkeeping is plain kernel heap. */
 bool nptAllocPage(void *, rhv::npt::Page *out)
@@ -173,6 +231,9 @@ bool com_overlorddev_RyzenHVVmShared::init()
     bzero(fVcpus, sizeof(fVcpus));
     fRam = nullptr;
     fPagesMapped = 0;
+    bzero(fLazy, sizeof(fLazy));
+    fNLazy = 0;
+    fLazyGen = 0;
     fRw = IORWLockAlloc();
     fRegLock = IOLockAlloc();
     return fRw && fRegLock;
@@ -190,6 +251,9 @@ void com_overlorddev_RyzenHVVmShared::free()
     }
     /* Unpins every buffer that is still mapped, then returns the tables. */
     fNpt.shutdown(&releaseOwner, this);
+    for (uint32_t i = 0; i < fNLazy; i++)
+        freeChunks(fLazy[i]);
+    fNLazy = 0;
     if (fRam) {
         fRam->release();
         fRam = nullptr;
@@ -202,12 +266,15 @@ void com_overlorddev_RyzenHVVmShared::free()
         IOLockFree(fRegLock);
         fRegLock = nullptr;
     }
+    /* A guest's TSC writes must not have reached the host: look once the VM is gone (on a kernel thread, it runs a rendezvous). */
+    rhv::svm::scheduleTscCheck("a VM was destroyed");
     OSObject::free();
 }
 
 bool com_overlorddev_RyzenHVVmShared::setup(uint32_t flags, task_t owner)
 {
     fOwner = owner;
+    fNptGen = 1;
     if (!fNpt.init(kNptAllocator))
         return false;
     if (!(flags & RHV_VMCREATE_NO_RAM)) {
@@ -300,20 +367,23 @@ static bool mdSegment(void *ctx, uint64_t offset, uint64_t *pa, uint64_t *len)
 
 /*
  * Maps [0, size) of `md` at guest physical `gpa`, page by page, all or nothing.
- * Wires `md` (prepare) and holds a reference on it until the last page is unmapped.
+ * Wires `md` (prepare) and holds a reference on it until the last page is unmapped. With `prepared` the caller already
+ * wired it (outside the lock) and hands that wiring over: it is undone here on failure, and by the last unmap otherwise.
  * Caller holds the lock or is still constructing the VM.
  */
 IOReturn com_overlorddev_RyzenHVVmShared::mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa,
-                                                        uint64_t size, uint32_t perm)
+                                                        uint64_t size, uint32_t perm, bool prepared)
 {
     for (uint64_t off = 0; off < size; off += 4096) {
         if (fNpt.isMapped(gpa + off)) {
             RHV_DBG("VM map: guest page 0x%llx is already mapped", (unsigned long long)(gpa + off));
+            if (prepared)
+                md->complete(kIODirectionInOut);
             return kIOReturnBusy;
         }
     }
 
-    IOReturn rc = md->prepare(kIODirectionInOut);
+    IOReturn rc = prepared ? kIOReturnSuccess : md->prepare(kIODirectionInOut);
     if (rc != kIOReturnSuccess) {
         RHV_WARN("VM map: cannot pin the buffer: 0x%x", rc);
         return rc;
@@ -368,13 +438,28 @@ IOReturn com_overlorddev_RyzenHVVmShared::map(task_t task, uint64_t uva, uint64_
         size > rhv::npt::kGpaLimit - gpa || uva + size < uva)
         return kIOReturnBadArgument;
 
+    if (lazyMapEnabled() && size >= kLazyMinBytes && (perm & rhv::npt::PERM_R)) {
+        IOReturn lrc = mapLazy(task, uva, gpa, size, perm);
+        if (lrc != kIOReturnUnsupported)
+            return lrc;
+        /* no free lazy slot: map it the old way */
+    }
+
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(uva, size, kIODirectionInOut, task);
     if (!md)
         return kIOReturnVMError;   /* typically an unmapped or non-writable range */
 
     kickAll();
     IORWLockWrite(fRw);            /* no vCPU is inside the guest while the tables change */
-    IOReturn rc = mapDescriptorLocked(md, gpa, size, perm);
+    /* A lazy range owns its GPAs even where nothing is mapped yet (0.7.22 returned Busy there, every page was mapped): an eager map
+     * inside it would later be evicted with the chunk and re-faulted from the lazy range's memory. */
+    IOReturn rc = kIOReturnSuccess;
+    for (uint32_t i = 0; i < fNLazy; i++)
+        if (gpa < fLazy[i].gpa + fLazy[i].size && fLazy[i].gpa < gpa + size)
+            rc = kIOReturnBusy;
+    if (rc == kIOReturnSuccess)
+        rc = mapDescriptorLocked(md, gpa, size, perm);
+    fNptGen++;
     IORWLockUnlock(fRw);
 
     md->release();                 /* the backing took its own reference */
@@ -392,8 +477,15 @@ IOReturn com_overlorddev_RyzenHVVmShared::map(task_t task, uint64_t uva, uint64_
 
 IOReturn com_overlorddev_RyzenHVVmShared::readPhys(uint64_t gpa, void *dst, size_t len)
 {
-    uint8_t *out = (uint8_t *)dst;
     IORWLockRead(fRw);                     /* a map/unmap waits; the pages are pinned while they are mapped */
+    const IOReturn rc = readPhysLocked(gpa, dst, len);
+    IORWLockUnlock(fRw);
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVVmShared::readPhysLocked(uint64_t gpa, void *dst, size_t len)
+{
+    uint8_t *out = (uint8_t *)dst;
     IOReturn rc = kIOReturnSuccess;
     while (len) {
         const size_t inPage = 4096 - (size_t)(gpa & 0xFFF);
@@ -416,7 +508,6 @@ IOReturn com_overlorddev_RyzenHVVmShared::readPhys(uint64_t gpa, void *dst, size
         }
         out += n; gpa += n; len -= n;
     }
-    IORWLockUnlock(fRw);
     return rc;
 }
 
@@ -428,6 +519,7 @@ IOReturn com_overlorddev_RyzenHVVmShared::unmap(uint64_t gpa, uint64_t size)
 
     kickAll();
     IORWLockWrite(fRw);
+    forgetLazyLocked(gpa, size);   /* first: no vCPU can fault a chunk of it back in once the lock is released */
     for (uint64_t off = 0; off < size; off += 4096) {
         void *owner = fNpt.unmap(gpa + off);
         if (owner) {
@@ -436,7 +528,8 @@ IOReturn com_overlorddev_RyzenHVVmShared::unmap(uint64_t gpa, uint64_t size)
             dropPage(static_cast<Backing *>(owner));
         }
     }
-    IORWLockUnlock(fRw);   /* the TLB is flushed on every VMRUN, see run() */
+    fNptGen++;
+    IORWLockUnlock(fRw);   /* every vCPU flushes its ASID on its next VMRUN, see run() */
 
     RHV_STAT_INC(vmUnmaps);
     return kIOReturnSuccess;
@@ -451,8 +544,10 @@ IOReturn com_overlorddev_RyzenHVVmShared::protect(uint64_t gpa, uint64_t size, u
 
     kickAll();
     IORWLockWrite(fRw);
-    IOReturn rc = kIOReturnSuccess;
-    for (uint64_t off = 0; off < size; off += 4096) {
+    /* A lazy range has no NPT entries yet where the guest has not been: map those first, so protect sees what an eager map would
+     * have left (rare: HyperKit never calls protect; it wires under the write lock, which a protect holds anyway). */
+    IOReturn rc = materializeLocked(gpa, size);
+    for (uint64_t off = 0; rc == kIOReturnSuccess && off < size; off += 4096) {
         if (!fNpt.isMapped(gpa + off)) {
             rc = kIOReturnNotFound;   /* check everything first so a failure changes nothing */
             break;
@@ -461,12 +556,595 @@ IOReturn com_overlorddev_RyzenHVVmShared::protect(uint64_t gpa, uint64_t size, u
     if (rc == kIOReturnSuccess) {
         for (uint64_t off = 0; off < size; off += 4096)
             fNpt.protect(gpa + off, perm);
+        /* The protected pages are now an ordinary eager mapping with their own rights: drop them from the lazy ranges, so reclaim
+         * never evicts them and a re-fault never re-enters them with the range's original rights. Their wiring stays with their
+         * Backings until the client unmaps them. */
+        forgetLazyLocked(gpa, size);
         RHV_STAT_INC(vmProtects);
     }
+    fNptGen++;
     IORWLockUnlock(fRw);
     return rc;
 }
 
+
+/* ---- lazy guest RAM (Vm.hpp) ---- */
+
+namespace {
+struct SubSeg {
+    IOMemoryDescriptor *md;
+    uint64_t            base;    /* where the sub-range starts inside md */
+};
+
+bool subSegment(void *ctx, uint64_t offset, uint64_t *pa, uint64_t *len)
+{
+    const SubSeg *s = static_cast<const SubSeg *>(ctx);
+    return mdSegment(s->md, s->base + offset, pa, len);
+}
+} // namespace
+
+int com_overlorddev_RyzenHVVmShared::lazyIndex(uint64_t gpa) const
+{
+    for (uint32_t i = 0; i < fNLazy; i++)
+        if (gpa >= fLazy[i].gpa && gpa - fLazy[i].gpa < fLazy[i].size)
+            return (int)i;
+    return -1;
+}
+
+bool com_overlorddev_RyzenHVVmShared::lazyCandidate(uint64_t gpa) const
+{
+    if (fNLazy == 0)
+        return false;
+    const uint64_t page = gpa & ~(uint64_t)0xFFF;
+    return lazyIndex(page) >= 0 && !fNpt.isMapped(page);
+}
+
+/*
+ * Maps [cs, ce) of lazy range `r` from `md`, which the caller wired and hands over (the last unmap undoes the wiring). Normally
+ * nothing in the chunk is mapped yet; if a client map/unmap carved into it, only the pages that are not mapped are entered.
+ */
+IOReturn com_overlorddev_RyzenHVVmShared::mapLazyChunkLocked(const LazyRange &r, uint64_t cs, uint64_t ce,
+                                                             IOMemoryDescriptor *md)
+{
+    bool partial = false;
+    for (uint64_t g = cs; g < ce; g += 4096)
+        if (fNpt.isMapped(g)) {
+            partial = true;
+            break;
+        }
+    if (!partial)
+        return mapDescriptorLocked(md, cs, ce - cs, r.perm, true);
+
+    Backing *b = (Backing *)IOMalloc(sizeof(Backing));
+    if (!b) {
+        md->complete(kIODirectionInOut);
+        return kIOReturnNoMemory;
+    }
+    md->retain();
+    b->md   = md;
+    b->live = 1;
+    IOReturn rc = kIOReturnSuccess;
+    for (uint64_t g = cs; g < ce; g += 4096) {
+        if (fNpt.isMapped(g))
+            continue;
+        SubSeg ss = { md, g - cs };
+        uint64_t done = 0;
+        const rhv::npt::Status st = fNpt.mapRange(g, 4096, r.perm, b, &subSegment, &ss, &done);
+        if (done) {
+            b->live++;
+            fPagesMapped++;
+            RHV_STAT_ADD(vmPagesMapped, 1);
+        }
+        if (st != rhv::npt::OK) {
+            rc = st == rhv::npt::NO_MEMORY ? kIOReturnNoMemory : kIOReturnVMError;
+            break;            /* what is mapped stays mapped: it is valid, and the next fault retries the rest */
+        }
+    }
+    dropPage(b);
+    return rc;
+}
+
+/* An hv_vm_map of at least kLazyMinBytes: record it, wire and map only its first chunk (which also checks the client's range the
+ * way the eager path would: an unmapped or read-only range fails here, not at the guest's first touch). */
+IOReturn com_overlorddev_RyzenHVVmShared::mapLazy(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t perm)
+{
+    const uint64_t firstEnd0 = (gpa & ~(kLazyChunk - 1)) + kLazyChunk;
+    const uint64_t firstEnd  = firstEnd0 < gpa + size ? firstEnd0 : gpa + size;
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(uva, firstEnd - gpa, kIODirectionInOut, task);
+    if (!md)
+        return kIOReturnVMError;
+    IOReturn rc = md->prepare(kIODirectionInOut);
+    if (rc != kIOReturnSuccess) {
+        RHV_WARN("VM map (lazy): cannot pin the first chunk: 0x%x", rc);
+        md->release();
+        RHV_STAT_INC(vmMapFailures);
+        return rc;
+    }
+    const uint64_t chunkBase = gpa >> 21;
+    const uint32_t nChunks   = (uint32_t)(((gpa + size - 1) >> 21) - chunkBase + 1);
+    uint8_t *chunks = allocChunks(nChunks);     /* nullptr only costs reclaim for this range */
+
+    kickAll();
+    IORWLockWrite(fRw);
+    for (uint64_t off = 0; rc == kIOReturnSuccess && off < size; off += 4096)
+        if (fNpt.isMapped(gpa + off))
+            rc = kIOReturnBusy;
+    for (uint32_t i = 0; rc == kIOReturnSuccess && i < fNLazy; i++)
+        if (gpa < fLazy[i].gpa + fLazy[i].size && fLazy[i].gpa < gpa + size)
+            rc = kIOReturnBusy;
+    if (rc == kIOReturnSuccess && fNLazy == kMaxLazy)
+        rc = kIOReturnUnsupported;
+    if (rc == kIOReturnSuccess) {
+        LazyRange &r = fLazy[fNLazy++];
+        r.gpa  = gpa;
+        r.size = size;
+        r.uva  = uva;
+        r.perm = perm;
+        r.task = task;
+        r.gen  = ++fLazyGen;
+        r.chunk     = chunks;
+        r.chunkBase = chunkBase;
+        r.nChunks   = chunks ? nChunks : 0;
+        chunks = nullptr;
+        rc = mapDescriptorLocked(md, gpa, firstEnd - gpa, perm, true);   /* takes over the wiring, also on failure */
+        if (rc != kIOReturnSuccess)
+            freeChunks(fLazy[--fNLazy]);
+    } else {
+        md->complete(kIODirectionInOut);
+    }
+    fNptGen++;
+    IORWLockUnlock(fRw);
+    md->release();
+    if (chunks)
+        IOFree(chunks, nChunks);
+
+    if (rc == kIOReturnSuccess) {
+        RHV_STAT_INC(vmMaps);
+        RHV_INFO("VM map (lazy): uva 0x%llx -> gpa 0x%llx, %llu MiB, perm %u; chunks are wired on first touch",
+                 (unsigned long long)uva, (unsigned long long)gpa, (unsigned long long)(size >> 20), perm);
+    } else if (rc != kIOReturnUnsupported) {
+        RHV_STAT_INC(vmMapFailures);
+        RHV_WARN("VM map (lazy) failed (0x%x): uva 0x%llx gpa 0x%llx size 0x%llx", rc, (unsigned long long)uva,
+                 (unsigned long long)gpa, (unsigned long long)size);
+    }
+    return rc;
+}
+
+IOReturn com_overlorddev_RyzenHVVmShared::faultIn(task_t task, uint64_t gpa)
+{
+    const uint64_t t0 = __builtin_ia32_rdtsc();
+    const uint64_t page = gpa & ~(uint64_t)0xFFF;
+    LazyRange r = {};
+    bool have = false;
+    IORWLockRead(fRw);
+    const int i0 = lazyIndex(page);
+    if (i0 >= 0 && !fNpt.isMapped(page)) {
+        r    = fLazy[i0];
+        have = true;
+    }
+    IORWLockUnlock(fRw);
+    if (!have)
+        return kIOReturnSuccess;
+    if (r.task != task)
+        return kIOReturnNotPermitted;
+
+    const uint64_t c0 = page & ~(kLazyChunk - 1);
+    const uint64_t cs = c0 > r.gpa ? c0 : r.gpa;
+    const uint64_t ce = c0 + kLazyChunk < r.gpa + r.size ? c0 + kLazyChunk : r.gpa + r.size;
+
+    /* Wire outside the lock: a page-in from the compressor or swap sleeps, and every vCPU takes the lock for each VMRUN. */
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(r.uva + (cs - r.gpa), ce - cs, kIODirectionInOut, task);
+    if (!md)
+        return kIOReturnVMError;
+    IOReturn rc = md->prepare(kIODirectionInOut);
+    if (rc != kIOReturnSuccess) {
+        static volatile SInt32 logged;
+        if (OSIncrementAtomic(&logged) < 20)
+            RHV_ERR("VM lazy fault: cannot wire gpa 0x%llx-0x%llx: 0x%x", (unsigned long long)cs, (unsigned long long)ce, rc);
+        md->release();
+        return rc;
+    }
+
+    /*
+     * Only adds translations, so no vCPU needs to leave the guest and no ASID needs a flush (a not-present entry is never cached).
+     * The write lock still waits for every vCPU to pass an exit, which keeps Table's software state consistent; no kick: any exit
+     * (a host interrupt at the latest) lets it in.
+     */
+    IORWLockWrite(fRw);
+    const int i = lazyIndex(page);
+    if (i < 0 || fLazy[i].gen != r.gen) {
+        md->complete(kIODirectionInOut);   /* unmapped or carved while we wired: nothing to do, the guest runs again */
+        rc = kIOReturnSuccess;
+    } else {
+        LazyRange &lr = fLazy[i];
+        rc = mapLazyChunkLocked(lr, cs, ce, md);
+        if (rc == kIOReturnSuccess) {
+            RHV_STAT_INC(vmLazyFaults);
+            const uint64_t ci = (cs >> 21) - lr.chunkBase;
+            if (lr.chunk && ci < lr.nChunks) {
+                if (lr.chunk[ci] & kChunkEvicted) {
+                    RHV_STAT_INC(vmLazyRefaults);
+                    RHV_STAT_ADD(vmLazyRefaultCyc, __builtin_ia32_rdtsc() - t0);
+                }
+                lr.chunk[ci] = 0;
+            }
+        }
+    }
+    IORWLockUnlock(fRw);
+    md->release();
+    return rc;
+}
+
+/* protect over a lazy range: wire and map what the guest has not touched yet in [gpa, gpa+size), under the write lock. */
+IOReturn com_overlorddev_RyzenHVVmShared::materializeLocked(uint64_t gpa, uint64_t size)
+{
+    for (uint32_t i = 0; i < fNLazy; i++) {
+        const LazyRange r = fLazy[i];
+        const uint64_t lo = gpa > r.gpa ? gpa : r.gpa;
+        const uint64_t hi = gpa + size < r.gpa + r.size ? gpa + size : r.gpa + r.size;
+        for (uint64_t c0 = lo & ~(kLazyChunk - 1); c0 < hi; c0 += kLazyChunk) {
+            const uint64_t cs = c0 > r.gpa ? c0 : r.gpa;
+            const uint64_t ce = c0 + kLazyChunk < r.gpa + r.size ? c0 + kLazyChunk : r.gpa + r.size;
+            bool missing = false;
+            for (uint64_t g = cs; g < ce && !missing; g += 4096)
+                missing = !fNpt.isMapped(g);
+            if (!missing)
+                continue;
+            if (r.task != current_task())      /* the descriptor is built on the stored task: only valid from inside it */
+                return kIOReturnNotPermitted;
+            IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(r.uva + (cs - r.gpa), ce - cs, kIODirectionInOut, r.task);
+            if (!md)
+                return kIOReturnVMError;
+            IOReturn rc = md->prepare(kIODirectionInOut);
+            if (rc == kIOReturnSuccess)
+                rc = mapLazyChunkLocked(r, cs, ce, md);
+            md->release();
+            if (rc != kIOReturnSuccess)
+                return rc;
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+/* unmap: [gpa, gpa+size) stops being lazy. Pages already faulted in are unmapped by the caller as usual. */
+void com_overlorddev_RyzenHVVmShared::forgetLazyLocked(uint64_t gpa, uint64_t size)
+{
+    const uint64_t x = gpa, y = gpa + size;
+    for (uint32_t i = 0; i < fNLazy; i++) {
+        LazyRange &r = fLazy[i];
+        const uint64_t a = r.gpa, b = r.gpa + r.size;
+        if (y <= a || b <= x)
+            continue;
+        if (x <= a && y >= b) {                    /* all of it */
+            freeChunks(r);
+            fLazy[i] = fLazy[--fNLazy];
+            i--;
+        } else if (x <= a) {                       /* the head */
+            r.uva += y - a;
+            r.gpa  = y;
+            r.size = b - y;
+            r.gen  = ++fLazyGen;
+        } else if (y >= b) {                       /* the tail */
+            r.size = x - a;
+            r.gen  = ++fLazyGen;
+        } else if (fNLazy < kMaxLazy) {            /* the middle: split */
+            LazyRange t = r;
+            t.uva += y - a;
+            t.gpa  = y;
+            t.size = b - y;
+            t.gen  = ++fLazyGen;
+            r.size = x - a;
+            r.gen  = ++fLazyGen;
+            /* The tail gets its own copy of the chunk states (each range frees its own array). */
+            t.chunk = nullptr;
+            t.nChunks = 0;
+            if (r.chunk) {
+                t.chunkBase = y >> 21;
+                const uint64_t last = (b - 1) >> 21;
+                const uint32_t n = (uint32_t)(last - t.chunkBase + 1);
+                t.chunk = allocChunks(n);
+                if (t.chunk) {
+                    t.nChunks = n;
+                    for (uint32_t k = 0; k < n; k++) {
+                        const uint64_t src = t.chunkBase + k - r.chunkBase;
+                        t.chunk[k] = src < r.nChunks ? r.chunk[src] : 0;
+                    }
+                }
+            }
+            fLazy[fNLazy++] = t;
+        } else {                                   /* the middle, no free slot: the tail becomes eager */
+            const LazyRange keep = r;
+            if (materializeLocked(y, b - y) != kIOReturnSuccess)
+                RHV_ERR("VM unmap: could not wire the rest of a lazy range (gpa 0x%llx-0x%llx); the guest will fault there",
+                        (unsigned long long)y, (unsigned long long)b);
+            fLazy[i]      = keep;
+            fLazy[i].size = x - a;
+            fLazy[i].gen  = ++fLazyGen;
+        }
+    }
+}
+
+uint8_t *com_overlorddev_RyzenHVVmShared::allocChunks(uint32_t n)
+{
+    if (n == 0)
+        return nullptr;
+    uint8_t *p = (uint8_t *)IOMalloc(n);
+    if (p)
+        bzero(p, n);
+    return p;
+}
+
+void com_overlorddev_RyzenHVVmShared::freeChunks(LazyRange &r)
+{
+    if (r.chunk)
+        IOFree(r.chunk, r.nChunks);
+    r.chunk   = nullptr;
+    r.nChunks = 0;
+}
+
+/*
+ * One reclaim round. Phase 1 holds the page tables for reading (vCPUs keep running, map/unmap/faultIn wait): every mapped chunk's
+ * accessed bits are read and cleared, and one nptGen bump makes each vCPU flush its ASID at its next entry, so a later access sets A
+ * again. Phase 2, only when some chunk has been cold for `coldScans` rounds: kick, take the write lock, unmap those chunks (the last
+ * page of a chunk's Backing unwires it) and bump nptGen once for the batch.
+ */
+void com_overlorddev_RyzenHVVmShared::reclaimScan(uint32_t coldScans, uint32_t maxEvict)
+{
+    if (fNLazy == 0)
+        return;
+    uint64_t *victims = maxEvict ? (uint64_t *)IOMalloc(maxEvict * sizeof(uint64_t)) : nullptr;
+    uint32_t nv = 0;
+    uint64_t scanned = 0;
+
+    IORWLockRead(fRw);
+    for (uint32_t i = 0; i < fNLazy; i++) {
+        LazyRange &r = fLazy[i];
+        if (!r.chunk)
+            continue;
+        const uint64_t end = r.gpa + r.size;
+        for (uint64_t c = r.gpa >> 21; c <= (end - 1) >> 21; c++) {
+            const uint64_t lo = (c << 21) > r.gpa ? (c << 21) : r.gpa;
+            const uint64_t hi = ((c + 1) << 21) < end ? ((c + 1) << 21) : end;
+            bool acc = false;
+            if (fNpt.scanAccessed(lo, hi - lo, true, &acc) == 0)
+                continue;                        /* not resident: nothing to age */
+            scanned++;
+            const uint64_t ci = c - r.chunkBase;
+            if (ci >= r.nChunks)
+                continue;
+            uint8_t &st = r.chunk[ci];
+            if (acc)
+                st = 0;
+            else if ((st & kChunkColdMask) < kChunkColdMask)
+                st++;
+            if ((st & kChunkColdMask) >= coldScans && victims && nv < maxEvict)
+                victims[nv++] = c;
+        }
+    }
+    if (scanned)
+        __atomic_add_fetch(&fNptGen, 1, __ATOMIC_SEQ_CST);   /* readers only besides us: the write-lock users are shut out */
+    IORWLockUnlock(fRw);
+    RHV_STAT_INC(vmReclaimScans);
+    RHV_STAT_ADD(vmReclaimScanned, scanned);
+
+    if (nv) {
+        uint64_t evicted = 0;
+        kickAll();
+        IORWLockWrite(fRw);
+        for (uint32_t k = 0; k < nv; k++) {
+            const uint64_t c = victims[k];
+            int i = -1;
+            for (uint32_t j = 0; j < fNLazy && i < 0; j++) {     /* the range may have been trimmed or split meanwhile */
+                const uint64_t lo = (c << 21) > fLazy[j].gpa ? (c << 21) : fLazy[j].gpa;
+                if (lo < fLazy[j].gpa + fLazy[j].size && lo >= fLazy[j].gpa && (lo >> 21) == c)
+                    i = (int)j;
+            }
+            if (i < 0)
+                continue;
+            LazyRange &r = fLazy[i];
+            const uint64_t ci = c - r.chunkBase;
+            if (!r.chunk || ci >= r.nChunks || (r.chunk[ci] & kChunkColdMask) < coldScans)
+                continue;
+            const uint64_t end = r.gpa + r.size;
+            const uint64_t lo = (c << 21) > r.gpa ? (c << 21) : r.gpa;
+            const uint64_t hi = ((c + 1) << 21) < end ? ((c + 1) << 21) : end;
+            bool any = false;
+            for (uint64_t g = lo; g < hi; g += 4096) {
+                void *owner = fNpt.unmap(g);
+                if (owner) {
+                    any = true;
+                    fPagesMapped--;
+                    RHV_STAT_ADD(vmPagesMapped, -1);
+                    dropPage(static_cast<Backing *>(owner));
+                }
+            }
+            r.chunk[ci] = kChunkEvicted;
+            if (any)
+                evicted++;
+        }
+        fNptGen++;
+        IORWLockUnlock(fRw);
+        RHV_STAT_ADD(vmReclaimEvicted, evicted);
+    }
+    if (victims)
+        IOFree(victims, maxEvict * sizeof(uint64_t));
+}
+
+void com_overlorddev_RyzenHVVmShared::reclaimAll(uint32_t coldScans, uint32_t maxEvict)
+{
+    IOLock *reg = sharedLock();
+    if (!reg)
+        return;
+    /* Held for the whole round: free() unlinks under this lock before it tears anything down, so no VM can go away under us. Lock
+     * order registry -> page tables / vCPU list; nothing takes the registry while holding those. */
+    IOLockLock(reg);
+    for (unsigned i = 0; i < sizeof(gShared) / sizeof(gShared[0]); i++)
+        if (gShared[i])
+            gShared[i]->reclaimScan(coldScans, maxEvict);
+    IOLockUnlock(reg);
+}
+
+namespace rhv {
+namespace vmcbcache {
+bool set(uint64_t flags)
+{
+    if (flags & ~(uint64_t)kAll)
+        return false;
+    gVmcbCache = (uint32_t)flags;
+    OSIncrementAtomic(&gVmcbCacheGen);
+    RHV_INFO("VMRUN shortcuts now 0x%x (bit 0 clean bits, bit 1 keep ASID)", (unsigned)flags);
+    return true;
+}
+uint32_t get() { return gVmcbCache; }
+} // namespace vmcbcache
+
+namespace exctrace {
+bool set(uint64_t mask)
+{
+    if (mask & ~(uint64_t)kAllowed)
+        return false;
+    if (mask && !gExcTrace) {               /* switched on: a fresh ring and fresh counts */
+        gExcPos = 0;
+        gExcReplays = 0;
+        bzero((void *)gExcCount, sizeof(gExcCount));
+    }
+    gExcTrace = (uint32_t)mask;
+    OSIncrementAtomic(&gVmcbCacheGen);      /* the intercept vector is a clean-bit group: every vCPU starts clean once, as for hv cache */
+    RHV_INFO("exception trace now 0x%x%s", (unsigned)mask, mask ? " (debugging: these vectors exit once each, then the CPU delivers them)" : " (off)");
+    return true;
+}
+uint32_t get() { return gExcTrace; }
+
+void dump(uint32_t n)
+{
+    const uint32_t total = (uint32_t)gExcPos;
+    RHV_INFO("exctrace: %d of them replays (the CPU had no chance to deliver the one before, rip unchanged)", (int)gExcReplays);
+    RHV_INFO("exctrace: mask 0x%x, %u recorded; per vector: #UD %d #NM %d #TS %d #NP %d #SS %d #GP %d #PF %d #AC %d", (unsigned)gExcTrace, total,
+             (int)gExcCount[6], (int)gExcCount[7], (int)gExcCount[10], (int)gExcCount[11], (int)gExcCount[12],
+             (int)gExcCount[13], (int)gExcCount[14], (int)gExcCount[17]);
+    if (n > kExcN)
+        n = kExcN;
+    if (n > total)
+        n = total;
+    RHV_INFO("exctrace: the newest %u, oldest first, two lines each (seq vm vcpu vector err exitintinfo/err rip rsp rflags info2(#PF address) "
+             "cr0 cr2 cr3 cs cpl; then R = replay, and the code bytes at rip)", n);
+    for (uint32_t i = total - n; i < total; i++) {
+        const volatile ExcRec *slot = &gExcRing[i & (kExcN - 1)];
+        if (slot->seq != i + 1)
+            continue;                        /* overwritten before reading */
+        ExcRec r;
+        memcpy(&r, (const void *)slot, sizeof(r));
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (r.seq != i + 1 || slot->seq != i + 1)
+            continue;                        /* overwritten while reading */
+        char b[16 * 3 + 1];
+        unsigned k = 0;
+        for (unsigned j = 0; j < r.nbytes && j < 16; j++)
+            k += (unsigned)snprintf(b + k, sizeof(b) - k, "%02x ", r.bytes[j]);
+        b[k] = 0;
+        RHV_INFO("x%u vm%u v%u #%u err %x ii %x/%x ip %llx sp %llx fl %llx i2 %llx cr0 %llx cr2 %llx cr3 %llx cs %x c%u", r.seq, r.vm, r.vcpu, r.vec,
+                 r.err, r.intInfo, r.intErr, (unsigned long long)r.rip, (unsigned long long)r.rsp, (unsigned long long)r.rflags,
+                 (unsigned long long)r.info2, (unsigned long long)r.cr0, (unsigned long long)r.cr2, (unsigned long long)r.cr3, r.cs, r.cpl);
+        RHV_INFO("x%u%s code: %s", r.seq, r.replay ? " R" : "", r.nbytes ? b : "(not read)");
+    }
+}
+} // namespace exctrace
+
+namespace reclaim {
+namespace {
+volatile uint32_t gOn       = 0;
+volatile uint32_t gPeriodMs = 10000;
+volatile uint32_t gCold     = 6;
+volatile uint32_t gBatchMiB = 256;
+volatile uint32_t gStopping = 0;
+thread_call_t     gCall     = nullptr;
+
+void arm()
+{
+    thread_call_t c = gCall;                 /* read once: stop() may clear it meanwhile */
+    if (c && gOn && !gStopping) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(gPeriodMs, kMillisecondScale, &deadline);
+        thread_call_enter_delayed(c, deadline);
+    }
+}
+
+void tick(thread_call_param_t, thread_call_param_t)
+{
+    if (!gOn || gStopping)
+        return;
+    uint32_t batch = gBatchMiB / 2;          /* 2 MiB chunks */
+    if (batch == 0)
+        batch = 1;
+    com_overlorddev_RyzenHVVmShared::reclaimAll(gCold, batch);
+    arm();
+}
+} // namespace
+
+bool enabled() { return gOn != 0; }
+
+bool set(uint32_t cmd, uint64_t value)
+{
+    switch (cmd) {
+    case kRHVHvReclaim:
+        if (value > 1)
+            return false;
+        if (value && !gCall) {
+            thread_call_t c = thread_call_allocate_with_options(&tick, nullptr, THREAD_CALL_PRIORITY_LOW, THREAD_CALL_OPTIONS_ONCE);
+            if (!c)
+                return false;
+            if (!OSCompareAndSwapPtr(nullptr, c, (void *volatile *)&gCall))
+                thread_call_free(c);
+        }
+        gOn = (uint32_t)value;
+        if (gOn)
+            arm();
+        RHV_INFO("reclaim of cold guest RAM: %s (every %u ms, cold after %u scans, at most %u MiB per scan)", gOn ? "on" : "off",
+                 gPeriodMs, gCold, gBatchMiB);
+        return true;
+    case kRHVHvReclaimPeriod:
+        if (value < 1000 || value > 600000)
+            return false;
+        gPeriodMs = (uint32_t)value;
+        return true;
+    case kRHVHvReclaimCold:
+        if (value < 1 || value > 63)
+            return false;
+        gCold = (uint32_t)value;
+        return true;
+    case kRHVHvReclaimBatch:
+        if (value < 2 || value > 16384)
+            return false;
+        gBatchMiB = (uint32_t)value;
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint64_t get(uint32_t cmd)
+{
+    switch (cmd) {
+    case kRHVHvReclaim:       return gOn;
+    case kRHVHvReclaimPeriod: return gPeriodMs;
+    case kRHVHvReclaimCold:   return gCold;
+    case kRHVHvReclaimBatch:  return gBatchMiB;
+    default:                  return 0;
+    }
+}
+
+void stop()
+{
+    gStopping = 1;
+    gOn = 0;
+    thread_call_t c = gCall;
+    if (c && OSCompareAndSwapPtr(c, nullptr, (void *volatile *)&gCall)) {
+        thread_call_cancel_wait(c);
+        thread_call_free(c);
+    }
+}
+} // namespace reclaim
+} // namespace rhv
 
 /* ---- one vCPU ---- */
 
@@ -560,6 +1238,29 @@ bool com_overlorddev_RyzenHVVm::init()
     fRunCpu        = -1;
     fFirstRun    = true;
     fHaveNextRip = false;
+    bzero(fProf, sizeof(fProf));
+    fFpuCheckCount = 0;
+    fSnap.forget();
+    fAsid.gen = 0; fAsid.asid = 0; fAsid.cpu = -1;
+    fSeenNptGen = 0;                 /* never equal to nptGen(): the first VMRUN flushes */
+    fSeenEpoch  = 0;
+    fSeenCacheGen = 0;                /* never equal to gVmcbCacheGen (starts at 1): the first VMRUN starts clean */
+    fTraceAdded = 0;
+    fTraceSkip = 0;
+    fTraceLastRip = ~0ull;
+    fTraceSkipRip = 0;
+    fTraceReplay = false;
+    fTlbFlushPending = true;
+    {
+        /* Where each field runEx reports lives, worked out once instead of after every exit. */
+        static const uint32_t kRun[RHV_RUN_NFIELDS] = {
+#define RHV_X(enc) enc,
+            RHV_RUN_FIELDS_LIST(RHV_X)
+#undef RHV_X
+        };
+        for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++)
+            fRunPlan[i] = rhv::vmx::VmcsState::plan(kRun[i]);
+    }
 
     fLock = IOLockAlloc();
     return fLock != nullptr;
@@ -806,10 +1507,28 @@ void com_overlorddev_RyzenHVVm::kick()
         mp_cpus_call(1ull << cpu, 2 /* NOSYNC */, kickAction, nullptr);
 }
 
+void com_overlorddev_RyzenHVVm::profFlush()
+{
+    RHV_STAT_ADD(vmCycTrap, fProf[kProfTrap]);
+    RHV_STAT_ADD(vmTraps, fProf[kProfTraps]);
+    RHV_STAT_ADD(vmCycRun, fProf[kProfRun]);
+    RHV_STAT_ADD(vmCycPre, fProf[kProfPre]);
+    RHV_STAT_ADD(vmCycGuest, fProf[kProfGuest]);
+    RHV_STAT_ADD(vmCycPost, fProf[kProfPost]);
+    RHV_STAT_ADD(vmProfExits, fProf[kProfExits]);
+    RHV_STAT_ADD(vmCycFeIn, fProf[kProfFeIn]);
+    RHV_STAT_ADD(vmCycRunEx, fProf[kProfRunEx]);
+    RHV_STAT_ADD(vmCycFeOut, fProf[kProfFeOut]);
+    RHV_STAT_ADD(vmTlbFlushes, fProf[kProfFlushes]);
+    RHV_STAT_ADD(vmAsidNew, fProf[kProfAsidNew]);
+    bzero(fProf, sizeof(fProf));
+}
+
 IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 {
     IOReturn rc = kIOReturnSuccess;
     Vmcb *v = (Vmcb *)fVmcb.va;
+    const uint64_t tRun0 = __builtin_ia32_rdtsc();
 
     IOLockLock(fLock);
     RHV_STAT_INC(vmRuns);
@@ -866,11 +1585,25 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
 
     bool rescanned  = false;          /* CPUs that came online after the kext started: look for them once per run */
     bool needRescan = false;
+    bool sleepWait  = false;          /* SVM is off for sleep: wait a little before going back to the client */
+    const uint64_t kNoLazyGpa = ~0ull;
+    uint64_t lazyGpa = kNoLazyGpa;    /* a first touch of lazy guest RAM, wired at the top of the loop where no lock is held */
 
     for (;;) {
+        const uint64_t tPre0 = __builtin_ia32_rdtsc();
         if (needRescan) {             /* outside the page-table lock and with interrupts on: it runs a rendezvous and may allocate */
             needRescan = false;
             svm::rescan();
+        }
+        if (lazyGpa != kNoLazyGpa) {  /* lazy guest RAM: interrupts on, no lock held, may sleep for a page-in */
+            const uint64_t g = lazyGpa;
+            lazyGpa = kNoLazyGpa;
+            const IOReturn fr = fShared->faultIn(current_task(), g);
+            if (fr != kIOReturnSuccess) {
+                RHV_ERR("VmRun: vCPU %u cannot bring in guest RAM at gpa 0x%llx (0x%x)", fIndex, (unsigned long long)g, fr);
+                rc = fr;
+                break;
+            }
         }
         if (fKick) {                  /* hv_vcpu_interrupt from another thread */
             if (injectionWaiting()) {
@@ -899,8 +1632,6 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
 
         v->control.exitCode = 0;
-        v->control.tlbCtl   = TLB_FLUSH_ALL;
-        v->control.clean    = 0;      /* every field is dirty, we never use clean bits yet */
 
         uint64_t hostCr2;
         __asm__ volatile("movq %%cr2, %0" : "=r"(hostCr2));   /* guest page faults can overwrite it */
@@ -921,10 +1652,26 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             needRescan = true;
             continue;
         }
+        if (!svm::activeOnAllUsable() && svm::suspended()) {
+            /* The Mac is going to sleep (or has not finished waking): SVM is off on purpose. An error here made HyperKit abort
+             * ("vmentry error"). Hand the client a time-slice exit instead, as for a kick; it calls run again, and after the wake
+             * resume() has SVM back on. The short sleep keeps a client that loops on run from spinning meanwhile. */
+            fRunCpu = -1;
+            ml_set_interrupts_enabled(ints);
+            {
+                static volatile SInt32 sleepLogged;
+                if (OSIncrementAtomic(&sleepLogged) < 20)
+                    RHV_INFO("VmRun: SVM is off for sleep, vCPU %u waits for the wake", fIndex);
+            }
+            sleepWait = true;              /* slept after the loop, when the page-table lock is no longer held */
+            timeslice = true;
+            takePendingEvent();
+            break;
+        }
         if (!svm::activeOnAllUsable()) {
             fRunCpu = -1;
             ml_set_interrupts_enabled(ints);
-            RHV_ERR("VmRun: SVM was turned off under us (sleep?), not entering the guest");
+            RHV_ERR("VmRun: SVM was turned off under us, not entering the guest");
             rc = kIOReturnNotReady;
             break;
         }
@@ -946,6 +1693,65 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
             RHV_ERR("VmRun: SVM cannot be used on cpu %d (not usable or no save area), not entering the guest", runCpu);
             rc = kIOReturnNotReady;
             break;
+        }
+        /*
+         * rhv-info hv exctrace (debugging, see gExcTrace): add the traced vectors the client does not intercept itself, minus the ones
+         * just traced (this VMRUN lets the CPU deliver them). Before the clean-bit check below, which sees the intercept change. With the
+         * trace off and nothing added, the client's bitmap is not touched.
+         */
+        if (fVmx) {
+            const uint32_t trace = gExcTrace;
+            if (trace | fTraceAdded) {
+                const uint32_t client = v->control.interceptExc & ~fTraceAdded;
+                fTraceAdded = trace & ~fTraceSkip & ~client;
+                v->control.interceptExc = client | fTraceAdded;
+            }
+        }
+        /*
+         * ASID and clean bits (VmcbCache.hpp). Up to 0.7.21 all vCPUs shared ASID 1 and every entry flushed it, so the guest refilled
+         * its TLB after each exit. Now a vCPU keeps its ASID on this CPU and flushes it only when the translations behind it changed.
+         * Interrupts are off: this CPU's pool is ours alone.
+         */
+        {
+            const uint32_t ep = svm::epoch();
+            if (ep != fSeenEpoch) {           /* SVM went off/on somewhere: nothing cached survives */
+                fSeenEpoch = ep;
+                fSnap.forget();
+                fAsid.cpu = -1;
+            }
+            const uint32_t cg = (uint32_t)gVmcbCacheGen;
+            if (cg != fSeenCacheGen) {        /* rhv-info hv cache changed: start clean once (all dirty, new ASID) */
+                fSeenCacheGen = cg;
+                fSnap.forget();
+                fAsid.cpu = -1;
+            }
+            const uint32_t nAsids = svm::numAsids(runCpu);
+            rhv::vmcb::AsidResult ar = rhv::vmcb::ASID_NEW_GENERATION;
+            if (nAsids >= 2) {
+                ar = rhv::vmcb::assignAsid(&gAsidPool[runCpu], nAsids, &fAsid, runCpu);
+                v->control.asid = fAsid.asid;
+            } else {
+                v->control.asid = 1;          /* cannot happen (VmCreate checked): the old behaviour, flush everything */
+                fAsid.cpu = -1;
+            }
+            const uint32_t cache  = gVmcbCache;                  /* kRHVHvCache, read once for this VMRUN */
+            const uint32_t dirty  = fSnap.dirty(v, runCpu);     /* after the ASID is in: it is a clean-bit field too */
+            const uint64_t nptGen = fShared->nptGen();
+            uint8_t tlb = TLB_DO_NOTHING;
+            if (ar == rhv::vmcb::ASID_NEW_GENERATION)
+                tlb = TLB_FLUSH_ALL;          /* this CPU hands its ASIDs out again: flush them all, once per wrap */
+            else if (ar == rhv::vmcb::ASID_NEW || fTlbFlushPending || nptGen != fSeenNptGen || (dirty & rhv::vmcb::CLEAN_FLUSH_GROUPS) ||
+                     !(cache & rhv::vmcbcache::kKeepAsid))
+                tlb = svm::flushByAsid(runCpu) ? TLB_FLUSH_GUEST : TLB_FLUSH_ALL;
+            if (tlb != TLB_DO_NOTHING) {
+                fTlbFlushPending = false;
+                fSeenNptGen = nptGen;
+                fProf[kProfFlushes]++;
+            }
+            if (ar != rhv::vmcb::ASID_KEPT)
+                fProf[kProfAsidNew]++;
+            v->control.tlbCtl = tlb;
+            v->control.clean  = (svmFix == 0 && (cache & rhv::vmcbcache::kClean) && svm::vmcbClean(runCpu)) ? (rhv::vmcb::CLEAN_KNOWN & ~dirty) : 0;
         }
 
         /*
@@ -984,45 +1790,89 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         if (fVmx) {
             hostDr[0] = rhv_read_dr(0); hostDr[1] = rhv_read_dr(1); hostDr[2] = rhv_read_dr(2);
             hostDr[3] = rhv_read_dr(3); hostDr[4] = rhv_read_dr(6); hostDr[5] = rhv_read_dr(7);
-            rhv_write_dr(7, 0);                       /* no breakpoint can fire while the registers change */
-            for (unsigned i = 0; i < 4; i++)
-                rhv_write_dr(i, fVmcs.dr(i));
+            /* Writes to debug registers are slow and nearly always useless here (host and guest both 0): write only what differs. */
+            bool dr7Off = false;
+            for (unsigned i = 0; i < 4; i++) {
+                const uint64_t g = fVmcs.dr(i);
+                if (g == hostDr[i])
+                    continue;
+                if (!dr7Off) {
+                    rhv_write_dr(7, 0);               /* no breakpoint can fire while the registers change */
+                    dr7Off = true;
+                }
+                rhv_write_dr(i, g);
+            }
         }
 
         /* RDTSCP reads IA32_TSC_AUX, which VMRUN does not switch: put the guest's value in for the run. */
         uint64_t hostTscAux = 0;
         if (fVmx && fHasTscAux) {
             hostTscAux = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);
-            rhv_wrmsr(rhv::msr::MSR_TSC_AUX, fVmcs.tscAux());
+            if (fVmcs.tscAux() != hostTscAux)
+                rhv_wrmsr(rhv::msr::MSR_TSC_AUX, fVmcs.tscAux());
         }
 
+        const uint64_t tGuest0 = __builtin_ia32_rdtsc();
         rhv_svm_vmrun(&fGprs, fVmcb.pa, fHostVmcb.pa);
+        const uint64_t tGuest1 = __builtin_ia32_rdtsc();
         fRunCpu = -1;
+        fSnap.take(v, runCpu);                /* before anything writes the VMCB again */
+        if (fTraceSkip) {                     /* exctrace: the CPU had its chance to deliver them; intercepted again from the next VMRUN */
+            /* Unless this VMRUN left before the guest moved (host interrupt, NMI, nested page fault at the same rip): then the next
+             * record of that rip is most likely the same fault again; it is marked as a replay instead of being counted as new. */
+            const uint64_t c = v->control.exitCode;
+            fTraceReplay = (c == EXIT_INTR || c == EXIT_NMI || c == EXIT_NPF) && v->save.rip == fTraceSkipRip;
+            fTraceSkip = 0;
+        } else if (fTraceReplay && !(v->control.exitCode >= 0x40 && v->control.exitCode <= 0x5F)) {
+            fTraceReplay = false;             /* the guest ran on without a traced exception */
+        }
 
         if (fVmx && fHasTscAux) {
-            fVmcs.setTscAux(rhv_rdmsr(rhv::msr::MSR_TSC_AUX));
-            rhv_wrmsr(rhv::msr::MSR_TSC_AUX, hostTscAux);
+            const uint64_t g = rhv_rdmsr(rhv::msr::MSR_TSC_AUX);
+            fVmcs.setTscAux(g);
+            if (g != hostTscAux)
+                rhv_wrmsr(rhv::msr::MSR_TSC_AUX, hostTscAux);
         }
 
         if (fVmx) {
-            for (unsigned i = 0; i < 4; i++)
-                fVmcs.setDr(i, rhv_read_dr(i));
-            rhv_write_dr(7, 0);
-            rhv_write_dr(0, hostDr[0]); rhv_write_dr(1, hostDr[1]); rhv_write_dr(2, hostDr[2]);
-            rhv_write_dr(3, hostDr[3]); rhv_write_dr(6, hostDr[4]); rhv_write_dr(7, hostDr[5]);
+            bool dr7Off = false;
+            for (unsigned i = 0; i < 4; i++) {
+                const uint64_t g = rhv_read_dr(i);
+                fVmcs.setDr(i, g);
+                if (g == hostDr[i])
+                    continue;
+                if (!dr7Off) {
+                    rhv_write_dr(7, 0);
+                    dr7Off = true;
+                }
+                rhv_write_dr(i, hostDr[i]);
+            }
+            if (rhv_read_dr(6) != hostDr[4])
+                rhv_write_dr(6, hostDr[4]);
+            if (dr7Off || rhv_read_dr(7) != hostDr[5])     /* #VMEXIT leaves DR7 at its reset value */
+                rhv_write_dr(7, hostDr[5]);
         }
 
         rhv::fpu::xsave(fGuestFpu.va, guestX);
         if (guestX != hostX)
             rhv::fpu::xsetbv0(hostX);
         rhv::fpu::xrstor(fHostFpu.va, hostX);
-        /* Self-check: the host state must be bit for bit what it was (this code uses no SSE of its own). */
-        rhv::fpu::xsave(fScratchFpu.va, hostX);
-        if (!rhv::fpu::legacyEqual((const uint8_t *)fHostFpu.va, (const uint8_t *)fScratchFpu.va))
-            RHV_STAT_INC(vmFpuMismatches);
+        /* Self-check: the host state must be bit for bit what it was (this code uses no SSE of its own). One run in 64: it is a third XSAVE. */
+        if ((fFpuCheckCount++ & 63) == 0) {
+            rhv::fpu::xsave(fScratchFpu.va, hostX);
+            if (!rhv::fpu::legacyEqual((const uint8_t *)fHostFpu.va, (const uint8_t *)fScratchFpu.va))
+                RHV_STAT_INC(vmFpuMismatches);
+        }
         rhv::fpu::restoreTs(wasTs);
 
         __asm__ volatile("movq %0, %%cr2" : : "r"(hostCr2));
+        {
+            const uint64_t tPost1 = __builtin_ia32_rdtsc();
+            fProf[kProfPre]   += tGuest0 - tPre0;
+            fProf[kProfGuest] += tGuest1 - tGuest0;
+            fProf[kProfPost]  += tPost1 - tGuest1;
+            fProf[kProfExits]++;
+        }
         ml_set_interrupts_enabled(ints);   /* a pending host interrupt is taken right here */
 
         if (svmFix > 0) {
@@ -1055,6 +1905,61 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 v->control.eventInjErr = v->control.exitIntInfoErr;
             }
             /* The host needed the CPU. It has it now; run on unless the slice is over. */
+            if (mach_absolute_time() >= deadline && !injectionWaiting()) {
+                timeslice = true;
+                takePendingEvent();
+                break;
+            }
+            continue;
+        }
+
+        /*
+         * rhv-info hv exctrace: an exception only the trace intercepts. The client never sees it. Record it, then go back in without that
+         * intercept: RIP still points at the faulting instruction, so the CPU raises the exception again and delivers it itself. An event
+         * whose delivery it hit is injected again (it raises the exception again during that delivery); not a software interrupt or
+         * software exception, whose re-injection needs nextRip: RIP points at the INTn/INT3/INTO and the guest executes it again.
+         */
+        if (code >= 0x40 && code <= 0x5F && (fTraceAdded & (1u << (code - 0x40)))) {
+            const unsigned vec = (unsigned)(code - 0x40);
+            traceException(vec);
+            fTraceSkip |= 1u << vec;
+            fTraceSkipRip = v->save.rip;
+            const uint32_t ii = v->control.exitIntInfo;
+            const uint32_t type = (ii >> 8) & 7, iv = ii & 0xFF;
+            const bool softEvent = type == 4 || (type == 3 && (iv == 3 || iv == 4));
+            if ((ii & (1u << 31)) && !softEvent) {
+                v->control.eventInj    = ii;
+                v->control.eventInjErr = v->control.exitIntInfoErr;
+            }
+            if (mach_absolute_time() >= deadline && !injectionWaiting()) {
+                timeslice = true;
+                takePendingEvent();
+                break;
+            }
+            continue;
+        }
+
+        /*
+         * WRMSR to the TSC while the client made the TSC native: the write is intercepted on purpose (MsrMap.hpp setNative), a guest
+         * write passed through would set the host core's own TSC. Apply it to the VMCB offset, as the framework would, and run on.
+         */
+        if (fVmx && code == EXIT_MSR && v->control.exitInfo1 == 1 && (uint32_t)fGprs.rcx == rhv::msr::MSR_TSC &&
+            rhv::msr::isNative((const uint8_t *)fMsrpm.va, rhv::msr::MSR_TSC)) {
+            const uint64_t value = ((fGprs.rdx & 0xFFFFFFFFull) << 32) | (v->save.rax & 0xFFFFFFFFull);
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            fVmcs.writeMsr(rhv::msr::MSR_TSC, ((uint64_t)hi << 32) | lo, value);
+            v->save.rip = v->control.nextRip ? v->control.nextRip : v->save.rip + 2;   /* WRMSR is 0F 30 */
+            {
+                static volatile SInt32 tscWrites;
+                if (OSIncrementAtomic(&tscWrites) < 5)       /* logging is fine here: interrupts are back on */
+                    RHV_INFO("vCPU %u: guest wrote the TSC (0x%llx), applied to the TSC offset, the host TSC is untouched", fIndex,
+                             (unsigned long long)value);
+            }
+            if (v->control.exitIntInfo & (1u << 31)) {
+                v->control.eventInj    = v->control.exitIntInfo;
+                v->control.eventInjErr = v->control.exitIntInfoErr;
+            }
             if (mach_absolute_time() >= deadline && !injectionWaiting()) {
                 timeslice = true;
                 takePendingEvent();
@@ -1110,8 +2015,35 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
                 continue;
             }
         }
+
+        /* First touch of a chunk of lazy guest RAM: the client never sees it. The page tables are still held for reading here. */
+        if (code == EXIT_NPF && fShared->lazyCandidate(v->control.exitInfo2)) {
+            /*
+             * The fault hit while an event was being delivered: deliver it again. Not a software interrupt (type 4, INTn) or a
+             * software exception (type 3 with vector 3 = INT3 or 4 = INTO): their re-injection needs a return address in nextRip,
+             * which an NPF exit does not provide (NRIPS fills it only for instruction intercepts). RIP still points at the
+             * instruction, so the guest simply executes it again, as KVM does for INT3/INTO.
+             */
+            const uint32_t ii = v->control.exitIntInfo;
+            const uint32_t type = (ii >> 8) & 7, vec = ii & 0xFF;
+            const bool softEvent = type == 4 || (type == 3 && (vec == 3 || vec == 4));
+            if ((ii & (1u << 31)) && !softEvent) {
+                v->control.eventInj    = ii;
+                v->control.eventInjErr = v->control.exitIntInfoErr;
+            }
+            lazyGpa = v->control.exitInfo2;
+            continue;
+        }
         break;
     }
+
+    if (fTraceAdded) {                /* exctrace: the client gets its own exception bitmap back */
+        v->control.interceptExc &= ~fTraceAdded;
+        fTraceAdded = 0;
+    }
+
+    if (sleepWait)
+        IOSleep(20);
 
     if (rc == kIOReturnSuccess) {
         bool vmxTranslated = false;
@@ -1157,8 +2089,88 @@ IOReturn com_overlorddev_RyzenHVVm::run(bool skipInstruction, RHVExit *out)
         }
     }
 
+    fProf[kProfRun] += __builtin_ia32_rdtsc() - tRun0;
+    if (fProf[kProfExits] >= kProfFlush)
+        profFlush();
     IOLockUnlock(fLock);
     return rc;
+}
+
+/*
+ * exctrace: the guest's code at a linear address, read through its own page tables (4-level long mode, or no paging) and the nested
+ * ones. Called in the run loop, which holds the page tables for reading. Returns how many bytes it read (up to 16, not past the page).
+ */
+static uint8_t fetchGuestCode(com_overlorddev_RyzenHVVmShared *sh, const Vmcb *v, uint64_t lin, uint8_t *out)
+{
+    const uint64_t kAddr = 0x000FFFFFFFFFF000ull;
+    uint64_t pa = lin;
+    if (v->save.cr0 & (1ull << 31)) {                                  /* CR0.PG */
+        if (!(v->save.efer & (1ull << 10)) || (v->save.cr4 & (1ull << 12)))
+            return 0;                                                  /* only long mode with 4 levels (no LA57, no 32-bit paging) */
+        uint64_t table = v->save.cr3 & kAddr;
+        bool ok = false;
+        for (int level = 3; level >= 0; level--) {
+            const uint64_t shift = 12 + 9 * (uint64_t)level;
+            uint64_t e = 0;
+            if (sh->readPhysLocked(table + ((lin >> shift) & 511) * 8, &e, sizeof(e)) != kIOReturnSuccess || !(e & 1))
+                return 0;
+            if (level == 0 || ((e & 0x80) && (level == 1 || level == 2))) {
+                const uint64_t mask = (1ull << shift) - 1;
+                pa = (e & kAddr & ~mask) | (lin & mask);
+                ok = true;
+                break;
+            }
+            table = e & kAddr;
+        }
+        if (!ok)
+            return 0;
+    }
+    size_t n = 16;
+    const size_t toPage = 4096 - (size_t)(pa & 0xFFF);
+    if (n > toPage)
+        n = toPage;
+    return sh->readPhysLocked(pa, out, n) == kIOReturnSuccess ? (uint8_t)n : 0;
+}
+
+void com_overlorddev_RyzenHVVm::traceException(unsigned vec)
+{
+    const Vmcb *v = (const Vmcb *)fVmcb.va;
+    OSIncrementAtomic(&gExcCount[vec & 31]);
+    const SInt32 pos = OSIncrementAtomic(&gExcPos);
+    ExcRec r;
+    bzero(&r, sizeof(r));
+    r.seq     = (uint32_t)pos + 1;
+    r.vm      = (uint32_t)fShared->id();
+    r.vcpu    = fIndex;
+    r.vec     = vec;
+    r.err     = ((vec >= 10 && vec <= 14) || vec == 17) ? (uint32_t)v->control.exitInfo1 : 0;   /* only vectors with an error code */
+    r.info2   = v->control.exitInfo2;
+    r.intInfo = v->control.exitIntInfo;
+    r.intErr  = v->control.exitIntInfoErr;
+    r.rip     = v->save.rip;
+    r.rsp     = v->save.rsp;
+    r.rflags  = v->save.rflags;
+    r.cr0     = v->save.cr0;
+    r.cr2     = v->save.cr2;
+    r.cr3     = v->save.cr3;
+    r.cs      = v->save.cs.selector;
+    r.cpl     = v->save.cpl;
+    /* The code bytes cost a page walk: read them when the rip changes (a loop on one instruction is read once), and every 256th record. */
+    if (fTraceReplay && v->save.rip == fTraceSkipRip) {
+        r.replay = 1;
+        OSIncrementAtomic(&gExcReplays);
+    }
+    fTraceReplay = false;
+    /* 64-bit code (EFER.LMA and CS.L): rip is the linear address and must be canonical. Otherwise (compatibility mode, legacy modes)
+     * it is CS.base + EIP, 32 bits. */
+    const bool code64 = (v->save.efer & (1ull << 10)) && (v->save.cs.attrib & (1u << 9));
+    const uint64_t lin = code64 ? v->save.rip : ((v->save.cs.base + v->save.rip) & 0xFFFFFFFFull);
+    const bool canonical = !code64 || (uint64_t)((int64_t)(lin << 16) >> 16) == lin;
+    if (canonical && (lin != fTraceLastRip || (r.seq & 255) == 0)) {
+        fTraceLastRip = lin;
+        r.nbytes = fetchGuestCode(fShared, v, lin, r.bytes);
+    }
+    gExcRing[(uint32_t)pos & (kExcN - 1)] = r;
 }
 
 IOReturn com_overlorddev_RyzenHVVm::msrOp(uint32_t op, uint32_t msrNum, uint64_t value, uint64_t *out)
@@ -1218,6 +2230,15 @@ IOReturn com_overlorddev_RyzenHVVm::getFpu(RHVFpuState *out)
     bcopy(fGuestFpu.va, out->area, fFpuSize);
     IOLockUnlock(fLock);
     return kIOReturnSuccess;
+}
+
+uint64_t com_overlorddev_RyzenHVVm::copyGuestFpu(void *dst, uint32_t max)
+{
+    IOLockLock(fLock);
+    const uint64_t xcr0 = fGuestXcr0;
+    bcopy(fGuestFpu.va, dst, fFpuSize < max ? fFpuSize : max);
+    IOLockUnlock(fLock);
+    return xcr0;
 }
 
 IOReturn com_overlorddev_RyzenHVVm::setFpu(const RHVFpuState *in)
@@ -1288,11 +2309,13 @@ IOReturn com_overlorddev_RyzenHVVm::runEx(const RHVRunIn *in, RHVRunOut *out)
     }
 
     getRegs(&out->regs);
-    unsigned n = 0;
     IOLockLock(fLock);                                    /* one lock for all the fields, not one per field */
-#define RHV_X(enc) do { uint64_t v_ = 0; if (fVmx) (void)fVmcs.read(enc, &v_); out->fields[n++] = v_; } while (0);
-    RHV_RUN_FIELDS_LIST(RHV_X)
-#undef RHV_X
+    for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++) {
+        uint64_t v_ = 0;
+        if (fVmx)
+            (void)fVmcs.readPlanned(fRunPlan[i], &v_);
+        out->fields[i] = v_;
+    }
     IOLockUnlock(fLock);
     return kIOReturnSuccess;
 }

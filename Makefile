@@ -11,7 +11,7 @@ BUILD := build
 CC    ?= cc
 CXX   ?= c++
 
-.PHONY: all test tools shim hijack hijack-patchonly kext clean
+.PHONY: kext-release all test tools shim hijack hijack-patchonly kext clean
 
 all: tools shim kext
 
@@ -29,10 +29,14 @@ test: | $(BUILD)
 	$(BUILD)/vmx_map_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/vmcs_state_test tests/vmcs_state_test.cpp
 	$(BUILD)/vmcs_state_test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/vmcb_cache_test tests/vmcb_cache_test.cpp
+	$(BUILD)/vmcb_cache_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -mavx2 -fsanitize=address,undefined -g -o $(BUILD)/fpu_state_test tests/fpu_state_test.cpp
 	$(BUILD)/fpu_state_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/msr_map_test tests/msr_map_test.cpp
 	$(BUILD)/msr_map_test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/vcpu_name_test tests/vcpu_name_test.cpp
+	$(BUILD)/vcpu_name_test
 	$(CC) -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $(BUILD)/patch_test tests/patch_test.c shim/rhv_patch.c
 	$(BUILD)/patch_test
 	$(CC) -arch x86_64 -Wall -Wextra -Werror -Wno-nullability-completeness -fsanitize=address,undefined -g -o $(BUILD)/shim_core_test tests/shim_core_test.c shim/rhv_core.c -framework Hypervisor
@@ -50,7 +54,10 @@ tools: | $(BUILD)
 		-framework IOKit -framework CoreFoundation
 	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-long-test tools/rhv-long-test/main.c \
 		-framework IOKit -framework CoreFoundation
+	$(CC) -arch x86_64 -Wall -Wextra -O2 -o $(BUILD)/rhv-tsc-check tools/rhv-tsc-check/main.c
 	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-smoke tools/hvf-smoke/main.c \
+		-framework Hypervisor
+	$(CC) -arch x86_64 -Wall -Wextra -Wno-nullability-completeness -O2 -o $(BUILD)/hvf-exit-bench tools/hvf-exit-bench/main.c \
 		-framework Hypervisor
 
 SHIM_SRC := shim/hv_shim.c shim/rhv_core.c shim/rhv_iokit.c shim/rhv_patch.c
@@ -81,6 +88,11 @@ hijack-patchonly: | $(BUILD)
 		-o $(BUILD)/$(HIJACK_NAME) shim/hijack_patchonly.c shim/rhv_patch.c
 
 kext:
+	$(MAKE) -C kext
+
+# What goes onto an ESP: every object rebuilt from scratch, then the symbol and ABI checks (scripts/check-kext-*.sh).
+kext-release:
+	$(MAKE) -C kext clean
 	$(MAKE) -C kext
 
 clean:

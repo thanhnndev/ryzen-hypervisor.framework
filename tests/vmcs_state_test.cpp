@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../include/RyzenHVShared.h"
 #include "../kext/Source/VmcsState.hpp"
 #include "../shim/rhv_fields.h"
 
@@ -74,6 +75,15 @@ void testStateFields()
 
     /* Width masking: a 16-bit selector and a 32-bit limit drop the high bits. */
     CHECK(f.st.write(0x0804, 0xFFFF0010) == R_OK && f.vmcb.save.ss.selector == 0x10);
+    /* CPL follows SS.DPL both ways (a vCPU state loaded in user mode, e.g. a snapshot restore). */
+    CHECK(f.st.write(0x4818, 0xC0F3) == R_OK && f.vmcb.save.cpl == 3);            /* SS AR, DPL 3 */
+    CHECK((rd(f, 0x4818) & 0x60) == 0x60);
+    f.vmcb.save.ss.attrib = 0xC93;                                                  /* SYSRET left SS.DPL 0, CPL 3 */
+    CHECK((rd(f, 0x4818) & 0x60) == 0x60);                                          /* read back as CPL */
+    CHECK(f.st.write(0x4818, 0xC093) == R_OK && f.vmcb.save.cpl == 0);
+    CHECK((rd(f, 0x4818) & 0x60) == 0);
+    CHECK(f.st.write(0x4818, 0x10000 | 0x60) == R_OK && f.vmcb.save.cpl == 3);    /* unusable SS still carries the DPL */
+    CHECK(f.st.write(0x4818, 0xC093) == R_OK && f.vmcb.save.cpl == 0);
     CHECK(f.st.write(0x4804, 0x1FFFFFFFFull) == R_OK && f.vmcb.save.ss.limit == 0xFFFFFFFF);
     /* SYSENTER_CS is 32 bits in the VMCS but a 64-bit slot in the VMCB. */
     CHECK(f.st.write(0x482a, 0xFFFFFFFF08ull) == R_OK && f.vmcb.save.sysenterCs == 0xFFFFFF08 && rd(f, 0x482a) == 0xFFFFFF08);
@@ -363,6 +373,42 @@ void testShimFieldTable()
 
 } // namespace
 
+/* readPlanned (the front end's per-exit path since 0.7.21) gives exactly what read() gives, for every field and for the
+ * extension fields, whatever the VMCB holds. */
+void testReadPlan()
+{
+    Fixture f;
+    uint8_t *raw = reinterpret_cast<uint8_t *>(&f.vmcb);
+    uint32_t seed = 12345;
+    for (int round = 0; round < 20; round++) {
+        for (size_t i = 0; i < sizeof(f.vmcb); i++) {
+            seed = seed * 1103515245u + 12345u;
+            raw[i] = (uint8_t)(seed >> 16);
+        }
+        for (unsigned i = 0; i < rhv::vmx::kNumFields; i++) {
+            const uint32_t enc = rhv::vmx::kFields[i].encoding;
+            uint64_t a = 0, b = 0;
+            const Result ra = f.st.read(enc, &a);
+            const Result rb = f.st.readPlanned(VmcsState::plan(enc), &b);
+            CHECK(ra == rb);
+            CHECK(a == b);
+        }
+        static const uint32_t ext[] = { 0xF000, 0xF002, 0xF004, 0xF010, 0xF012, 0xF014, 0xF016, 0x12345 };
+        for (uint32_t enc : ext) {
+            uint64_t a = 0, b = 0;
+            CHECK(f.st.read(enc, &a) == f.st.readPlanned(VmcsState::plan(enc), &b));
+            CHECK(a == b);
+        }
+    }
+    static const uint32_t kRun[RHV_RUN_NFIELDS] = {
+#define RHV_X(enc) enc,
+        RHV_RUN_FIELDS_LIST(RHV_X)
+#undef RHV_X
+    };
+    for (uint32_t enc : kRun)
+        CHECK(VmcsState::plan(enc).valid);          /* every field runEx reports is one the core knows */
+}
+
 int main()
 {
     testShimFieldTable();
@@ -373,6 +419,7 @@ int main()
     testEventInjection();
     testRecordExit();
     testExtensionsAndMsrs();
+    testReadPlan();
     if (fails) {
         printf("vmcs_state_test: %d FAILED\n", fails);
         return 1;

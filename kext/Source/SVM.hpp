@@ -46,12 +46,26 @@ bool verifyAll(uint32_t *ok, uint32_t *total);
 uint32_t activeCpuCount();
 
 /*
+ * Checks that the TSC is the same on every core: every CPU reads it in turn, ordered by a spin lock, inside one rendezvous
+ * (interrupts off on every CPU for about a millisecond). Logs the result, and on a failure the worst backwards step, the
+ * CPU pair and how far each CPU is ahead. Returns true when the TSC never went backwards; *worstCycles gets the worst
+ * step. Thread context only, no lock held (it runs a rendezvous).
+ */
+bool checkTsc(const char *why, uint64_t *worstCycles);
+
+/* checkTsc() on a kernel thread, from any context where a thread call may be entered (VM teardown). `why` must be a literal. */
+void scheduleTscCheck(const char *why);
+
+/*
  * True while SVM is on in every CPU that supports it (not suspended, not
  * disabled). Cheap and lock-free: VmRun calls it with interrupts disabled,
  * right before VMRUN. Interrupts being off is what makes it race-free: the
  * suspend/disable rendezvous cannot complete without this CPU.
  */
 bool activeOnAllUsable();
+
+/* True between the sleep notification (suspend) and the wake (resume): SVM is off on purpose and comes back by itself. */
+bool suspended();
 
 /*
  * For VmRun, on the CPU it is about to VMRUN on, with interrupts off. VMRUN's first instruction here is CLGI, which is #UD (a
@@ -66,6 +80,21 @@ int ensureThisCpu();      /* also -2: this CPU was not known when SVM was enable
 
 /* How many times ensureThisCpu() had to restore something. */
 uint32_t healedCount();
+
+/* This CPU can flush one ASID's TLB entries on VMRUN (CPUID 0x8000000A EDX bit 6), so a guest flush leaves the host's entries alone. */
+bool flushByAsid(int cpu);
+
+/* This CPU honours VMCB clean bits (CPUID 0x8000000A EDX bit 5). */
+bool vmcbClean(int cpu);
+
+/* ASIDs this CPU offers (CPUID 0x8000000A EBX); 0 is the host's, guests use 1 .. numAsids-1. */
+uint32_t numAsids(int cpu);
+
+/*
+ * Changes whenever SVM was turned off or on anywhere (enable, disable, sleep, wake, rescan, a CPU whose EFER.SVME had to be
+ * restored). A vCPU that sees it change forgets its cached VMCB state and its ASID: VmcbCache.hpp.
+ */
+uint32_t epoch();
 
 /*
  * The CPUs are counted once, when the kext starts. On macOS 26 the other cores are not online yet at that moment (a Ryzen 9 5900X showed "cpus=1"), so

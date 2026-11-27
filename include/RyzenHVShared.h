@@ -18,8 +18,9 @@ extern "C" {
 #define RHV_ABI_VERSION 11
 #define RHV_SERVICE_NAME "com_overlorddev_RyzenHV"
 #define RHV_MAX_CPUS 64
-/* Largest number of vCPUs in one VM. */
-#define RHV_MAX_VCPUS_PER_VM 16
+/* Largest number of vCPUs in one VM. Was 16, which a 24-thread Ryzen (Docker gives HyperKit every core) ran past: the 17th
+ * hv_vcpu_create failed and HyperKit aborted. Only array sizes depend on it, no struct of this ABI. */
+#define RHV_MAX_VCPUS_PER_VM 64
 
 /*
  * IOUserClient selectors. Add new ones at the end.
@@ -140,8 +141,34 @@ enum {
     kRHVHvSvmRescan = 5, /* debugging: look for CPUs that came online late and turn SVM on there; state[1] is how many were enabled */
     kRHVHvDebug     = 6, /* debugging, value = flags: bit 0 records the last 512 exits of every client's vCPUs (off by default), bit 1 freezes the recording when a vCPU stays in one page of kernel code with interrupts off for 24 timeslice exits */
     kRHVHvFlightDump = 7, /* debugging, value N: writes N recorded exits to the kernel log (`rhv-info log`); value = N | (SKIP << 16): the newest SKIP exits are left out */
-    kRHVHvReadGuest  = 8  /* debugging, value = a 64-bit guest virtual address: walks the guest's page tables (CR3 of the last recorded exit) and logs 256 bytes there */
+    kRHVHvReadGuest  = 8, /* debugging, value = a 64-bit guest virtual address: walks the guest's page tables (CR3 of the last recorded exit) and logs 256 bytes there */
+    /*
+     * Since 0.7.23: reclaim of cold lazy guest RAM (kext/Source/Vm.cpp). value = kRHVHvGetValue only reads. Output: state[0] = the value
+     * now, state[1] = 1 when reclaim is on. Takes effect at the next scan; nothing needs a reboot or a VM restart.
+     */
+    kRHVHvReclaim       = 9,  /* 0/1: off (default) / on */
+    kRHVHvReclaimPeriod = 10, /* ms between scans, 1000..600000 (default 10000) */
+    kRHVHvReclaimCold   = 11, /* scans without a guest access before a chunk is unwired, 1..63 (default 6) */
+    kRHVHvReclaimBatch  = 12, /* MiB unwired at most per scan per VM, 2..16384 (default 256) */
+    /*
+     * Since 0.7.24: what VMRUN may skip (VmcbCache.hpp), for A/B tests without a reboot. value = flags, kRHVHvGetValue only reads;
+     * state[0] = the flags now. Takes effect at the next VMRUN of every vCPU.
+     *   bit 0: VMCB clean bits (0.7.22). Off: every VMRUN reloads the whole VMCB, as up to 0.7.21.
+     *   bit 1: a vCPU keeps its ASID's TLB entries across exits (0.7.22). Off: every VMRUN flushes the vCPU's ASID, as up to 0.7.21.
+     * Default 3 (both on, the 0.7.22 behaviour).
+     */
+    kRHVHvCache         = 13,
+    /*
+     * Since 0.7.24, debugging: trace guest exceptions (Vm.cpp rhv::exctrace). value = a bitmap of vectors, only #UD 6, #NM 7,
+     * #TS 10, #NP 11, #SS 12, #GP 13, #PF 14, #AC 17 (0 = off, the default); kRHVHvGetValue only reads, state[0] = the bitmap now.
+     * A traced exception the client does not intercept itself is recorded (vector, error code, rip, the first code bytes...) and
+     * the next VMRUN runs without that intercept, so the CPU raises and delivers it again itself (nested-fault rules untouched; #DF is not
+     * traceable for that reason).
+     */
+    kRHVHvExcTrace      = 14,
+    kRHVHvExcDump       = 15  /* debugging, value N: writes the newest N traced exceptions and the per-vector counts to the kernel log */
 };
+#define kRHVHvGetValue (~0ull)
 /* state bits returned in scalarOutput[0] */
 enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1, kRHVHvStateTpr = 1u << 2 };
 
@@ -247,7 +274,29 @@ typedef struct RHVStats {
     uint64_t vmProtects;
     uint64_t vmNptFaults;        /* RHV_EXIT_NPF handed to userland */
     uint64_t vmPagesMapped;      /* guest pages currently mapped, summed over VMs */
-    uint64_t vmFpuMismatches;    /* host x87/SSE state differed after a VMRUN round trip: must stay 0 */
+    uint64_t vmFpuMismatches;    /* host x87/SSE state differed after a VMRUN round trip: must stay 0 (checked on one run in 64 since 0.7.18) */
+    /* Since 0.7.18: where the time of a run goes, in TSC cycles, summed over all vCPUs (flushed every 1024 exits per vCPU). */
+    uint64_t vmCycTrap;          /* Hypervisor.framework thread trap hv_vcpu_run, whole (front end + run) */
+    uint64_t vmTraps;            /* those traps */
+    uint64_t vmCycRun;           /* VmRun, whole */
+    uint64_t vmCycPre;           /* loop iteration up to VMRUN: locks, checks, FPU/DR/TSC_AUX swap in */
+    uint64_t vmCycGuest;         /* VMRUN to #VMEXIT: the guest itself plus the world switch */
+    uint64_t vmCycPost;          /* #VMEXIT until interrupts are back on: swap out */
+    uint64_t vmProfExits;        /* exits counted in the sums above */
+    /* Since 0.7.21: the hv_vcpu_run trap split up (vmCycTrap = FeIn + RunEx + FeOut, roughly; RunEx includes vmCycRun). */
+    uint64_t vmCycFeIn;          /* front end before runEx: the client's dirty slots, MSRs, FP state into the core */
+    uint64_t vmCycRunEx;         /* runEx: registers in, run(), registers and the 55 exit fields out */
+    uint64_t vmCycFeOut;         /* front end after runEx: FP state, managed MSRs, slots into the page */
+    /* Since 0.7.22: per-vCPU ASIDs (counted in the same batches as the sums above, so per vmProfExits). */
+    uint64_t vmTlbFlushes;       /* VMRUNs that flushed the guest TLB (ASID moved, page tables or paging state changed) */
+    uint64_t vmAsidNew;          /* VMRUNs that gave the vCPU a new ASID (it moved to another CPU, or its first run) */
+    /* Since 0.7.23: lazy guest RAM and its reclaim (2 MiB chunks). */
+    uint64_t vmLazyFaults;       /* chunks wired and mapped on a guest touch (first touches and re-faults) */
+    uint64_t vmLazyRefaults;     /* of those, chunks that reclaim had unwired before */
+    uint64_t vmLazyRefaultCyc;   /* TSC cycles spent in those re-faults (wire + map), summed */
+    uint64_t vmReclaimScans;     /* scan rounds (per VM) */
+    uint64_t vmReclaimScanned;   /* mapped chunks looked at */
+    uint64_t vmReclaimEvicted;   /* chunks unwired and unmapped because they were cold */
 } RHVStats;
 
 /* Guest registers as seen by userland (VmGetRegs / VmSetRegs). */
@@ -373,7 +422,13 @@ typedef struct RHVLogChunk {
 
 /* Compile-time size checks that work in both C and C++. */
 typedef char rhv_assert_log_chunk_size[(sizeof(RHVLogChunk) == RHV_LOG_CHUNK_SIZE) ? 1 : -1];
-typedef char rhv_assert_stats_size[(sizeof(RHVStats) == 25 * sizeof(uint64_t)) ? 1 : -1];
+/* RHVStats size. The stats call accepts exactly this size or an older one (V2, V1) and copies only what the caller asked for. */
+#define RHV_STATS_SIZE    (43 * 8)
+#define RHV_STATS_SIZE_V4 (37 * 8)   /* 0.7.22 */
+#define RHV_STATS_SIZE_V3 (35 * 8)   /* 0.7.21 */
+#define RHV_STATS_SIZE_V2 (32 * 8)   /* 0.7.18-0.7.20 */
+#define RHV_STATS_SIZE_V1 (25 * 8)   /* before 0.7.18 */
+typedef char rhv_assert_stats_size[(sizeof(RHVStats) == RHV_STATS_SIZE) ? 1 : -1];
 typedef char rhv_assert_regs_size[(sizeof(RHVRegs) == 18 * sizeof(uint64_t)) ? 1 : -1];
 typedef char rhv_assert_fpu_size[(sizeof(RHVFpuState) == 16 + RHV_FPU_AREA_MAX) ? 1 : -1];
 typedef char rhv_assert_exit_size[(sizeof(RHVExit) == 48) ? 1 : -1];
@@ -433,6 +488,19 @@ static inline int rhv_is_amd_vendor(uint32_t ebx, uint32_t ecx, uint32_t edx)
 
 #ifdef __cplusplus
 }
+#endif
+
+#if defined(KERNEL) && defined(__cplusplus)
+/* Each kext object file records the sizes it was compiled with; scripts/check-kext-abi.sh compares them after the link. */
+#include "../kext/Source/AbiStamp.hpp"
+RHV_ABI_STAMP(RHVStats)
+RHV_ABI_STAMP(RHVInfo)
+RHV_ABI_STAMP(RHVRegs)
+RHV_ABI_STAMP(RHVExit)
+RHV_ABI_STAMP(RHVFpuState)
+RHV_ABI_STAMP(RHVRunIn)
+RHV_ABI_STAMP(RHVRunOut)
+RHV_ABI_STAMP(RHVLogChunk)
 #endif
 
 #endif /* RYZENHV_SHARED_H */

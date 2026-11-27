@@ -105,7 +105,7 @@ IOReturn com_overlorddev_RyzenHVUserClient::externalMethod(uint32_t selector,
         /* kRHVMethodSetLogLevel: 1 scalar in (level) */
         { (IOExternalMethodAction)&C::sSetLogLevel, 1, 0, 0, 0 },
         /* kRHVMethodGetStats */
-        { (IOExternalMethodAction)&C::sGetStats, 0, 0, 0, sizeof(RHVStats) },
+        { (IOExternalMethodAction)&C::sGetStats, 0, 0, 0, kIOUCVariableStructureSize },   /* size checked in sGetStats */
         /* kRHVMethodSelfTest: 2 scalars out (ok, total) */
         { (IOExternalMethodAction)&C::sSelfTest, 0, 0, 2, 0 },
         /* kRHVMethodVmCreate: 1 scalar in (flags), 2 scalars out (built-in RAM size, VM id) */
@@ -261,6 +261,42 @@ IOReturn com_overlorddev_RyzenHVUserClient::sHvControl(OSObject *target, void *,
         args->scalarOutput[1] = rhv::hv::mode();
         return kIOReturnSuccess;
     }
+    if (cmd >= kRHVHvReclaim && cmd <= kRHVHvReclaimBatch) {     /* reclaim of cold lazy guest RAM, Vm.cpp */
+        const uint64_t v64 = args->scalarInput[1];
+        if (v64 != kRHVHvGetValue) {
+            RHV_ADMIN();
+            if (!rhv::reclaim::set(cmd, v64))
+                return kIOReturnBadArgument;
+        }
+        args->scalarOutput[0] = rhv::reclaim::get(cmd);
+        args->scalarOutput[1] = rhv::reclaim::enabled() ? 1 : 0;
+        return kIOReturnSuccess;
+    }
+    if (cmd == kRHVHvExcTrace || cmd == kRHVHvExcDump) {         /* exception trace (debugging), Vm.cpp */
+        const uint64_t v64 = args->scalarInput[1];
+        if (cmd == kRHVHvExcDump) {
+            RHV_ADMIN();
+            rhv::exctrace::dump(value);
+        } else if (v64 != kRHVHvGetValue) {
+            RHV_ADMIN();
+            if (!rhv::exctrace::set(v64))
+                return kIOReturnBadArgument;
+        }
+        args->scalarOutput[0] = rhv::exctrace::get();
+        args->scalarOutput[1] = 0;
+        return kIOReturnSuccess;
+    }
+    if (cmd == kRHVHvCache) {                                     /* VMRUN shortcuts (clean bits, kept ASIDs), Vm.cpp */
+        const uint64_t v64 = args->scalarInput[1];
+        if (v64 != kRHVHvGetValue) {
+            RHV_ADMIN();
+            if (!rhv::vmcbcache::set(v64))
+                return kIOReturnBadArgument;
+        }
+        args->scalarOutput[0] = rhv::vmcbcache::get();
+        args->scalarOutput[1] = 0;
+        return kIOReturnSuccess;
+    }
     if (cmd == kRHVHvSvmLimit || cmd == kRHVHvSvmRescan) {
         RHV_ADMIN();
         uint32_t enabled = 0;
@@ -287,9 +323,14 @@ IOReturn com_overlorddev_RyzenHVUserClient::sGetStats(OSObject *target, void *,
                                                       IOExternalMethodArguments *args)
 {
     RHV_ME();
-    RHVStats stats;
-    me->fOwner->getStats(&stats);
-    bcopy(&stats, args->structureOutput, sizeof(stats));
+    static_assert(sizeof(RHVStats) == RHV_STATS_SIZE, "RHVStats changed: update RHV_STATS_SIZE and the tools");
+    /* The caller says which layout it was built with through its buffer size: this one or an older one (each is a prefix). Any other
+     * size is refused rather than guessed at, and only that many bytes are copied (no fixed-size buffer in between). */
+    const uint32_t size = args->structureOutputSize;
+    if (args->structureOutputDescriptor || !args->structureOutput || (size != RHV_STATS_SIZE && size != RHV_STATS_SIZE_V4 && size != RHV_STATS_SIZE_V3 && size != RHV_STATS_SIZE_V2 && size != RHV_STATS_SIZE_V1))
+        return kIOReturnBadArgument;
+    me->fOwner->getStats(args->structureOutput, size);
+    args->structureOutputSize = size;
     return kIOReturnSuccess;
 }
 
@@ -458,6 +499,8 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmUnmap(OSObject *target, void *,
 {
     RHV_ME();
     RHV_ADMIN();
+    if (current_task() != me->fTask)       /* as sVmMap: lazy RAM builds descriptors on the mapping task */
+        return kIOReturnNotPermitted;
     RHV_RETAIN_VM(vm);
     IOReturn rc = vm->unmap(args->scalarInput[0], args->scalarInput[1]);
     vm->release();
@@ -469,6 +512,8 @@ IOReturn com_overlorddev_RyzenHVUserClient::sVmProtect(OSObject *target, void *,
 {
     RHV_ME();
     RHV_ADMIN();
+    if (current_task() != me->fTask)       /* as sVmMap: lazy RAM builds descriptors on the mapping task */
+        return kIOReturnNotPermitted;
     if (args->scalarInput[2] > 0xFFFFFFFFull)
         return kIOReturnBadArgument;
     RHV_RETAIN_VM(vm);

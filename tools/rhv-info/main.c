@@ -9,6 +9,8 @@
  *   rhv-info selftest        verify SVM state on every CPU (root, needs rhv_enable_svm=1)
  */
 #include <IOKit/IOKitLib.h>
+#include <stddef.h>
+#include <sys/sysctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,7 +130,23 @@ static int cmd_stats(io_connect_t conn)
     memset(&s, 0, sizeof(s));
     size_t outSize = sizeof(s);
     kern_return_t kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
-    if (kr != KERN_SUCCESS || outSize != sizeof(s)) {
+    if (kr != KERN_SUCCESS) {                    /* an older kext has a shorter struct (each layout is a prefix of the next) */
+        outSize = RHV_STATS_SIZE_V4;
+        kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
+    }
+    if (kr != KERN_SUCCESS) {
+        outSize = RHV_STATS_SIZE_V3;
+        kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
+    }
+    if (kr != KERN_SUCCESS) {
+        outSize = RHV_STATS_SIZE_V2;
+        kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
+    }
+    if (kr != KERN_SUCCESS) {
+        outSize = RHV_STATS_SIZE_V1;
+        kr = IOConnectCallStructMethod(conn, kRHVMethodGetStats, NULL, 0, &s, &outSize);
+    }
+    if (kr != KERN_SUCCESS || (outSize != sizeof(s) && outSize != RHV_STATS_SIZE_V4 && outSize != RHV_STATS_SIZE_V3 && outSize != RHV_STATS_SIZE_V2 && outSize != RHV_STATS_SIZE_V1)) {
         fprintf(stderr, "GetStats failed: 0x%x (size %zu, expected %zu)\n", kr, outSize, sizeof(s));
         return 1;
     }
@@ -160,6 +178,57 @@ static int cmd_stats(io_connect_t conn)
     P(vmNptFaults);
     P(vmPagesMapped);
     P(vmFpuMismatches);
+    if (outSize >= RHV_STATS_SIZE_V2) {
+        P(vmCycTrap);
+        P(vmTraps);
+        P(vmCycRun);
+        P(vmCycPre);
+        P(vmCycGuest);
+        P(vmCycPost);
+        P(vmProfExits);
+        if (outSize >= RHV_STATS_SIZE_V3) {
+            P(vmCycFeIn);
+            P(vmCycRunEx);
+            P(vmCycFeOut);
+        }
+        if (outSize >= RHV_STATS_SIZE_V4) {
+            P(vmTlbFlushes);
+            P(vmAsidNew);
+        }
+        if (outSize >= RHV_STATS_SIZE) {
+            P(vmLazyFaults);
+            P(vmLazyRefaults);
+            P(vmLazyRefaultCyc);
+            P(vmReclaimScans);
+            P(vmReclaimScanned);
+            P(vmReclaimEvicted);
+        }
+        if (s.vmTraps && s.vmProfExits) {
+            /* per hv_vcpu_run trap and per VMRUN, in microseconds at the TSC rate */
+            uint64_t hz = 0;
+            size_t hl = sizeof(hz);
+            sysctlbyname("machdep.tsc.frequency", &hz, &hl, NULL, 0);
+            double us = hz ? 1e6 / (double)hz : 0;
+            printf("  per trap        : %.2f us (run %.2f us), %.2f VMRUNs per trap\n", s.vmCycTrap * us / s.vmTraps,
+                   s.vmCycRun * us / s.vmTraps, (double)s.vmProfExits / s.vmTraps);
+            if (outSize >= RHV_STATS_SIZE_V3)
+                printf("  trap split      : front end in %.2f us, runEx %.2f us (run %.2f), front end out %.2f us\n",
+                       s.vmCycFeIn * us / s.vmTraps, s.vmCycRunEx * us / s.vmTraps, s.vmCycRun * us / s.vmTraps,
+                       s.vmCycFeOut * us / s.vmTraps);
+            printf("  per VMRUN       : pre %.2f us, guest+switch %.2f us, post %.2f us\n", s.vmCycPre * us / s.vmProfExits,
+                   s.vmCycGuest * us / s.vmProfExits, s.vmCycPost * us / s.vmProfExits);
+            if (outSize >= RHV_STATS_SIZE_V4)
+                printf("  guest TLB       : flushed on %.1f%% of VMRUNs, new ASID on %.1f%%\n", 100.0 * s.vmTlbFlushes / s.vmProfExits,
+                       100.0 * s.vmAsidNew / s.vmProfExits);
+            if (outSize >= RHV_STATS_SIZE)
+                printf("  lazy RAM        : %.0f MiB wired now, %llu chunk faults, %llu re-faults (%.1f us each), %llu of %llu scanned chunks unwired\n",
+                       s.vmPagesMapped * 4096.0 / 1048576.0, (unsigned long long)s.vmLazyFaults, (unsigned long long)s.vmLazyRefaults,
+                       s.vmLazyRefaults ? s.vmLazyRefaultCyc * us / s.vmLazyRefaults : 0.0, (unsigned long long)s.vmReclaimEvicted,
+                       (unsigned long long)s.vmReclaimScanned);
+        }
+    } else {
+        puts("  (the loaded kext is older than 0.7.18: no profiling counters)");
+    }
 #undef P
     return 0;
 }
@@ -214,8 +283,70 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
     } else if (argc > 3 && !strcmp(argv[2], "readguest")) {
         in[0] = kRHVHvReadGuest;
         in[1] = strtoull(argv[3], NULL, 16);
+    } else if (argc > 2 && !strcmp(argv[2], "cache")) {
+        /* cache [N]: VMRUN shortcuts, bit 0 VMCB clean bits, bit 1 keep ASIDs across exits (3 = 0.7.22 default, 0 = as 0.7.21) */
+        uint64_t cin[2] = { kRHVHvCache, argc > 3 ? strtoull(argv[3], NULL, 0) : kRHVHvGetValue }, cout[2] = { 0, 0 };
+        uint32_t cn = 2;
+        kern_return_t ckr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, cin, 2, cout, &cn);
+        if (ckr != KERN_SUCCESS) {
+            fprintf(stderr, "hv cache: 0x%x (value must be 0..3; changing it needs root)\n", ckr);
+            return 1;
+        }
+        printf("VMRUN shortcuts: 0x%llx (clean bits %s, keep ASID %s)\n", (unsigned long long)cout[0],
+               (cout[0] & 1) ? "on" : "off", (cout[0] & 2) ? "on" : "off");
+        return 0;
+    } else if (argc > 2 && (!strcmp(argv[2], "exctrace") || !strcmp(argv[2], "excdump"))) {
+        /* exctrace [MASK]: trace these guest exception vectors (debugging; 0 = off); excdump [N]: log the newest N to `rhv-info log` */
+        const int dump = !strcmp(argv[2], "excdump");
+        uint64_t xin[2] = { dump ? kRHVHvExcDump : kRHVHvExcTrace,
+                            dump ? (argc > 3 ? strtoull(argv[3], NULL, 0) : 64) : (argc > 3 ? strtoull(argv[3], NULL, 0) : kRHVHvGetValue) },
+                 xout[2] = { 0, 0 };
+        uint32_t xn = 2;
+        kern_return_t xkr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, xin, 2, xout, &xn);
+        if (xkr != KERN_SUCCESS) {
+            fprintf(stderr, "hv %s: 0x%x (vectors allowed: 6 7 10 11 12 13 14 17, e.g. 0x27cc0 for all; changing it needs root)\n", argv[2], xkr);
+            return 1;
+        }
+        printf("exception trace: 0x%llx%s\n", (unsigned long long)xout[0], dump ? " (records written to the kernel log: rhv-info log)" : "");
+        return 0;
+    } else if (argc > 2 && !strcmp(argv[2], "reclaim")) {
+        /* reclaim [0|1] | reclaim period MS | reclaim cold N | reclaim batch MIB; no value: show all four */
+        static const struct { const char *name; uint64_t cmd; const char *unit; } knobs[] = {
+            { "on", kRHVHvReclaim, "" }, { "period", kRHVHvReclaimPeriod, " ms" }, { "cold", kRHVHvReclaimCold, " scans" },
+            { "batch", kRHVHvReclaimBatch, " MiB per scan" } };
+        uint64_t rin[2] = { kRHVHvReclaim, kRHVHvGetValue }, rout[2] = { 0, 0 };
+        if (argc > 3) {
+            const char *v = argv[3];
+            if (argc > 4) {
+                for (unsigned k = 1; k < 4; k++)
+                    if (!strcmp(argv[3], knobs[k].name))
+                        rin[0] = knobs[k].cmd;
+                if (rin[0] == kRHVHvReclaim) {
+                    fprintf(stderr, "usage: rhv-info hv reclaim [0|1 | period MS | cold N | batch MIB]\n");
+                    return 2;
+                }
+                v = argv[4];
+            }
+            rin[1] = strtoull(v, NULL, 0);
+            kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, rin, 2, rout, &(uint32_t){ 2 });
+            if (kr != KERN_SUCCESS) {
+                fprintf(stderr, "HvControl failed: 0x%x%s\n", kr, getuid() ? " (run with sudo)" : " (value out of range?)");
+                return 1;
+            }
+        }
+        for (unsigned k = 0; k < 4; k++) {
+            rin[0] = knobs[k].cmd;
+            rin[1] = kRHVHvGetValue;
+            kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, rin, 2, rout, &(uint32_t){ 2 });
+            if (kr != KERN_SUCCESS) {
+                fprintf(stderr, "HvControl failed: 0x%x (kext older than 0.7.23?)\n", kr);
+                return 1;
+            }
+            printf("reclaim %-6s: %llu%s\n", knobs[k].name, (unsigned long long)rout[0], knobs[k].unit);
+        }
+        return 0;
     } else if (argc > 2 && strcmp(argv[2], "status")) {
-        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA]\n");
+        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA | reclaim [0|1 | period MS | cold N | batch MIB] | cache [0..3] | exctrace [MASK] | excdump [N]]\n");
         return 2;
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, in, 2, out, &(uint32_t){ 2 });
@@ -261,7 +392,7 @@ int main(int argc, char **argv)
     const char *cmd = argc > 1 ? argv[1] : "info";
 
     if (!strcmp(cmd, "-h") || !strcmp(cmd, "--help") || !strcmp(cmd, "help")) {
-        puts("usage: rhv-info [info | log [-f] | stats | level <0-5> | selftest | hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1]]");
+        puts("usage: rhv-info [info | log [-f] | stats | level <0-5> | selftest | hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | reclaim [0|1 | period MS | cold N | batch MIB]]]");
         return 0;
     }
 

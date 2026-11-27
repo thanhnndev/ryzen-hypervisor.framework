@@ -66,6 +66,15 @@ int main()
         CHECK(map[b] == 0xFF);
     CHECK(!setNative(map, 0x2000, true) && !setNative(map, 0x40000000, true));
 
+    /* The TSC is native for reads only: a guest WRMSR passed through would set the host core's physical TSC. */
+    CHECK(setNative(map, MSR_TSC, true));
+    CHECK(isNative(map, MSR_TSC) && !writesNative(map, MSR_TSC));
+    CHECK(msrpmBit(MSR_TSC, &off, &bit) && !((map[off] >> bit) & 1) && ((map[off] >> (bit + 1)) & 1));
+    CHECK(setNative(map, MSR_LSTAR, true) && writesNative(map, MSR_LSTAR));
+    CHECK(setNative(map, MSR_TSC, false) && !isNative(map, MSR_TSC) && setNative(map, MSR_LSTAR, false));
+    for (size_t b = 0; b < sizeof(map); b++)
+        CHECK(map[b] == 0xFF);
+
     /* The whole supported set at once. */
     static const uint32_t all[] = { MSR_SYSENTER_CS, MSR_SYSENTER_ESP, MSR_SYSENTER_EIP, MSR_PAT, MSR_STAR, MSR_LSTAR,
                                     MSR_CSTAR, MSR_SFMASK, MSR_FS_BASE, MSR_GS_BASE, MSR_KERNEL_GS_BASE };

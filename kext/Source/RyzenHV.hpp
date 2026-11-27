@@ -25,7 +25,8 @@ public:
 
     /* Refreshes the dynamic fields and copies the current state out. */
     void getInfo(RHVInfo *out);
-    void getStats(RHVStats *out);
+    /* Copies the first `size` bytes of the counters (at most sizeof(RHVStats)) to `out`. */
+    void getStats(void *out, size_t size);
 
     /* Returns false when SVM is not active. */
     bool runSelfTest(uint32_t *ok, uint32_t *total);
@@ -39,5 +40,8 @@ private:
     IONotifier *fPMNotifier;
     bool        fSelfTest;
 };
+
+#include "AbiStamp.hpp"
+RHV_ABI_STAMP(com_overlorddev_RyzenHV)
 
 #endif /* RYZENHV_HPP */

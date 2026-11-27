@@ -92,7 +92,26 @@ There is also a small app, **RyzenHV**, with buttons for the same steps (kext, a
 - Only the **Intel build 4.97.0** is supported; `./rhv docker-desktop get` installs it. Turn off automatic updates in Docker's settings; after an update run
   `./rhv docker-desktop` again.
 - Quit Docker Desktop before running `./rhv docker-desktop`. The step also switches Docker to its HyperKit engine (not "Virtualization framework"); that is on purpose.
-- If Docker does not start after a restart of the Mac, delete the leftover file `~/Library/Containers/com.docker.docker/Data/vms/0/hyperkit.pid` and start it again.
+- Docker Desktop kills HyperKit whenever it stops the VM (Quit, Resource Saver, `docker desktop stop`) and leaves `~/Library/Containers/com.docker.docker/Data/vms/0/hyperkit.pid` behind, which made the next start fail with "Failed to set up pidfile". Since 0.7.12 RyzenHV patches HyperKit to overwrite that file. With an older kext, delete the file and start Docker again.
+- Containers that stay in "Created", `docker inspect` that hangs while `docker ps` still answers: HyperKit's virtio-sock had stopped. Its error path for a
+  connection that fails (the other side closed at once, or nobody listens on the port) took two locks in the wrong order, and the rx and tx threads waited for each
+  other, so every vsock connection of the VM stopped (logs, file sharing, container start). Since 0.7.13 RyzenHV patches both error paths of HyperKit to close the
+  socket the way the rest of HyperKit does. With an older kext, quit and start Docker Desktop again.
+- Panics with `assertion failed: now >= *pkt_enq_time` (classq_fq_codel.c), usually under heavy network traffic, mean the TSC is not the
+  same on every core, so `mach_absolute_time` goes backwards between cores. Check with `build/rhv-tsc-check` (no kext, no root) or
+  `rhv-info selftest` then `rhv-info log | grep "tsc check"`. A TSC-sync kext that writes the TSC on each core (ForgedInvariant 1.5.0 on
+  AMD writes MSR 0x10 on every thread after a barrier) leaves the cores a few hundred cycles apart; Zen firmware already syncs the TSC,
+  so turn it off (`-FIOff`). Before 0.7.14 a guest whose TSC the client made native (HyperKit does) could also write the host core's TSC:
+  the TSC is now native for reads only and a guest write goes to the VM's TSC offset.
+- Docker Desktop using a core or more while idle, `com.docker.backend.log` full of `wrmsr to register 0xc0000502(0x1)`: on Zen 5 the host
+  CPUID 0x80000021 EAX bit 22 (workload classification) reached the guest, and Linux writes MSR 0xC0000502 on every context switch,
+  which HyperKit does not know and logs. Since 0.7.17 RyzenHV clears the bit in HyperKit's CPUID answers (restart Docker Desktop).
+- An idle Docker VM still costs the host CPU: a Linux guest with many vCPUs takes thousands of timer interrupts and scheduler wake-up
+  IPIs a second, and in xAPIC mode each costs several exits to HyperKit (APIC accesses are nested page faults), ~50k exits/s for 24 vCPUs.
+  What one exit costs: `env DYLD_INSERT_LIBRARIES=$PWD/build/libryzenhv.dylib build/hvf-exit-bench`. Where the time goes in the kext
+  (0.7.18 and later): `rhv-info stats`, lines "per trap" and "per VMRUN". Since 0.7.18 a VMRUN flushes only the guest's TLB entries
+  (before, the host's TLB was flushed on every exit too) and skips debug-register and TSC_AUX writes that change nothing. Since 0.7.22
+  a vCPU keeps its own ASID across exits and VMRUN uses VMCB clean bits; `rhv-info stats` line "guest TLB" shows how often it still flushes.
 
 ### For every VM
 

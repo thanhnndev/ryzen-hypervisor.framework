@@ -26,6 +26,7 @@
 #include "FpuState.hpp"
 #include "Npt.hpp"
 #include "VmcsState.hpp"
+#include "VmcbCache.hpp"
 #include "PhysMem.hpp"
 #include "VMCB.hpp"
 
@@ -36,6 +37,36 @@ struct GuestGprs {
     uint64_t rbx, rcx, rdx, rsi, rdi, rbp;
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
 };
+
+/*
+ * Reclaim of cold lazy guest RAM (0.7.23, off by default). One thread call scans every VM's lazy chunks each period: it clears
+ * the NPT accessed bits, and a chunk that stays unaccessed for `cold` scans is unmapped and unwired (the guest's next touch wires it
+ * again through faultIn). Unwired pages stay resident until the host needs the memory. Set at run time through kRHVHvReclaim*.
+ */
+namespace reclaim {
+bool     set(uint32_t cmd, uint64_t value);     /* kRHVHvReclaim*; false: bad value */
+uint64_t get(uint32_t cmd);
+bool     enabled();
+void     stop();                                /* kext stop: cancels and frees the thread call */
+} // namespace reclaim
+
+namespace vmcbcache {
+enum : uint32_t { kClean = 1u << 0, kKeepAsid = 1u << 1, kAll = kClean | kKeepAsid };
+bool     set(uint64_t flags);                  /* kRHVHvCache; false: bad value */
+uint32_t get();
+} // namespace vmcbcache
+
+/* rhv-info hv exctrace / excdump (kRHVHvExcTrace, kRHVHvExcDump): debugging, off by default. */
+namespace exctrace {
+enum : uint32_t {
+    /* #UD #NM #TS #NP #SS #GP #PF #AC: faults, re-executed exactly. Not #DF: which event EXITINTINFO holds then decides whether the
+     * replay gives the guest #DF or the second fault, so it is not traced. */
+    kAllowed = (1u << 6) | (1u << 7) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13) | (1u << 14) | (1u << 17)
+};
+bool     set(uint64_t mask);                   /* false: a vector outside kAllowed */
+uint32_t get();
+void     dump(uint32_t n);
+} // namespace exctrace
 
 } // namespace rhv
 
@@ -57,6 +88,8 @@ public:
     uint64_t            id() const { return fId; }
     rhv::npt::Table    &npt() { return fNpt; }
     IORWLock           *rw() const { return fRw; }
+    /* Goes up whenever the nested page tables change (under the write lock): a vCPU that sees it move flushes its ASID. */
+    uint64_t            nptGen() const { return fNptGen; }
     IOMemoryDescriptor *ramDescriptor() const { return fRam; }
     uint32_t            ramSize() const { return fRam ? RHV_GUEST_RAM_SIZE : 0; }
 
@@ -64,8 +97,28 @@ public:
     IOReturn map(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t flags);
     IOReturn unmap(uint64_t gpa, uint64_t size);
     IOReturn protect(uint64_t gpa, uint64_t size, uint32_t flags);
-    /* Debugging (rhv-info hv readguest): reads guest physical memory through the nested page tables. Fails when a page is not mapped. */
+    /* Debugging (rhv-info hv readguest): reads guest physical memory through the nested page tables. Fails when a page is not mapped
+     * (with lazy RAM: also when the guest has not touched that chunk yet). */
     IOReturn readPhys(uint64_t gpa, void *dst, size_t len);
+    IOReturn readPhysLocked(uint64_t gpa, void *dst, size_t len);   /* the same, the caller holds rw() (a vCPU in its run loop) */
+
+    /*
+     * Lazy guest RAM. A large hv_vm_map (>= kLazyMinBytes) is not wired and entered into the NPT at once: the range is only
+     * recorded, and each 2 MiB chunk is wired and mapped the first time the guest touches it (a nested page fault that never
+     * reaches the client). Pages the guest never touches stay ordinary pageable memory of the client. Off with rhv_lazymap=0.
+     *
+     * lazyCandidate: is `gpa` inside a lazy range and not mapped yet? Caller holds rw() for reading.
+     * faultIn: wire and map the chunk around `gpa`. No lock held, interrupts on, may sleep (page-in). Called on the faulting
+     * vCPU's thread, so `task` is the client. Success also when there turned out to be nothing to do (another vCPU was faster,
+     * the range went away): the guest simply runs again, and a fault that is not ours then goes to the client as before.
+     */
+    bool     lazyCandidate(uint64_t gpa) const;
+    IOReturn faultIn(task_t task, uint64_t gpa);
+
+    /* One reclaim round over this VM (rhv::reclaim). Thread context, no lock held; the caller keeps the VM alive. */
+    void     reclaimScan(uint32_t coldScans, uint32_t maxEvict);
+    /* Every VM in the registry, with the registry lock held so none can be freed meanwhile. */
+    static void reclaimAll(uint32_t coldScans, uint32_t maxEvict);
 
     /* The vCPUs, for kicking them out of the guest. attach() fails with kIOReturnNoResources when the VM is full. */
     IOReturn attach(com_overlorddev_RyzenHVVm *vcpu, uint32_t *index);
@@ -80,7 +133,26 @@ public:
 
 private:
     bool     setup(uint32_t flags, task_t owner);
-    IOReturn mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa, uint64_t size, uint32_t perm);
+    IOReturn mapDescriptorLocked(IOMemoryDescriptor *md, uint64_t gpa, uint64_t size, uint32_t perm, bool prepared = false);
+
+    struct LazyRange {
+        uint64_t gpa, size, uva;
+        uint32_t perm;
+        task_t   task;       /* compared only: the range dies with the client's VM */
+        uint8_t *chunk;      /* per 2 MiB chunk: bits 0-5 scans without access, bit 7 unwired by reclaim; nullptr: no reclaim */
+        uint64_t chunkBase;  /* gpa >> 21 of chunk[0]; stays put when the range is trimmed */
+        uint32_t nChunks;    /* entries in chunk[] */
+        uint64_t gen;        /* fLazyGen when this range was created or last changed: faultIn's re-check (no ABA) */
+    };
+    enum : uint8_t { kChunkColdMask = 0x3F, kChunkEvicted = 0x80 };
+    static uint8_t *allocChunks(uint32_t n);
+    static void     freeChunks(LazyRange &r);
+    enum { kMaxLazy = 16 };
+    int      lazyIndex(uint64_t gpa) const;                          /* -1 when none; rw() held */
+    void     forgetLazyLocked(uint64_t gpa, uint64_t size);          /* unmap: cut [gpa, gpa+size) out of the lazy ranges */
+    IOReturn materializeLocked(uint64_t gpa, uint64_t size);         /* protect: map what is still lazy in [gpa, gpa+size) */
+    IOReturn mapLazyChunkLocked(const LazyRange &r, uint64_t cs, uint64_t ce, IOMemoryDescriptor *prepared);
+    IOReturn mapLazy(task_t task, uint64_t uva, uint64_t gpa, uint64_t size, uint32_t perm);   /* kIOReturnUnsupported: no slot */
     static void dropPage(Backing *b);
     static void releaseOwner(void *ctx, void *owner);
 
@@ -92,6 +164,10 @@ private:
     IOBufferMemoryDescriptor *fRam;
     rhv::npt::Table           fNpt;
     uint64_t                  fPagesMapped;
+    volatile uint64_t         fNptGen;
+    LazyRange                 fLazy[kMaxLazy];
+    uint32_t                  fNLazy;
+    uint64_t                  fLazyGen;    /* under the write lock */
 };
 
 class com_overlorddev_RyzenHVVm : public OSObject {
@@ -144,7 +220,23 @@ public:
     void     kick();
 
     IOReturn getFpu(RHVFpuState *out);
+    /* The guest's XSAVE image straight into `dst` (at most `max` bytes, the rest of `dst` untouched); returns its XCR0. For the
+     * front end after every exit: no zeroed 3 KiB staging copy in between. */
+    uint64_t copyGuestFpu(void *dst, uint32_t max);
     IOReturn setFpu(const RHVFpuState *in);
+
+    /* The front end's hv_vcpu_run trap took `cycles` TSC cycles (profiling, see RHVStats.vmCycTrap). Same thread as run(). */
+    /* hv_vcpu_invalidate_tlb: the next VMRUN flushes this vCPU's ASID. Same thread as run(). */
+    void     requestTlbFlush() { fTlbFlushPending = true; }
+
+    void     profTrap(uint64_t cycles, uint64_t feIn, uint64_t runEx)
+    {
+        fProf[kProfTrap] += cycles;
+        fProf[kProfTraps]++;
+        fProf[kProfFeIn] += feIn;
+        fProf[kProfRunEx] += runEx;
+        fProf[kProfFeOut] += cycles - feIn - runEx;
+    }
 
 private:
     bool     setup(uint32_t flags);
@@ -170,6 +262,34 @@ private:
     rhv::GuestGprs            fGprs;
     bool                      fFirstRun;
     bool                      fHaveNextRip;
+
+    /* Profiling sums of this vCPU, added to rhv::gStats every kProfFlush exits (one atomic per field, not per exit). */
+    enum { kProfTrap, kProfTraps, kProfRun, kProfPre, kProfGuest, kProfPost, kProfExits, kProfFeIn, kProfRunEx, kProfFeOut, kProfFlushes, kProfAsidNew, kProfCount };
+    static const uint32_t     kProfFlush = 1024;
+    uint64_t                  fProf[kProfCount];
+    uint32_t                  fFpuCheckCount;    /* the host FPU self-check runs on one VMRUN in 64 */
+    rhv::vmx::VmcsState::ReadPlan fRunPlan[RHV_RUN_NFIELDS];   /* the fields runEx reports, located once */
+
+    /* What the next VMRUN may skip, see VmcbCache.hpp. */
+    rhv::vmcb::Snapshot       fSnap;             /* the clean-bit fields at the last exit */
+    rhv::vmcb::AsidSlot       fAsid;
+    uint64_t                  fSeenNptGen;       /* fShared->nptGen() when this vCPU's ASID was last flushed */
+    uint32_t                  fSeenEpoch;        /* svm::epoch() at the last VMRUN */
+    uint32_t                  fSeenCacheGen;     /* gVmcbCacheGen at the last VMRUN (rhv-info hv cache) */
+
+    /* rhv-info hv exctrace (debugging, see Vm.cpp). All 0 while the trace is off. */
+    uint32_t                  fTraceAdded;       /* exception intercepts the trace added to the client's bitmap for this run */
+    uint32_t                  fTraceSkip;        /* vectors the next VMRUN lets the CPU deliver itself (just traced) */
+    uint64_t                  fTraceLastRip;     /* the code bytes are read again only when the rip changes */
+    uint64_t                  fTraceSkipRip;     /* rip of the exception fTraceSkip lets through */
+    bool                      fTraceReplay;      /* that VMRUN left before the guest moved: the next record there is a replay */
+    void                      traceException(unsigned vec);
+    bool                      fTlbFlushPending;
+    void                      profFlush();
 };
+
+#include "AbiStamp.hpp"
+RHV_ABI_STAMP(com_overlorddev_RyzenHVVm)
+RHV_ABI_STAMP(com_overlorddev_RyzenHVVmShared)
 
 #endif /* RYZENHV_VM_HPP */

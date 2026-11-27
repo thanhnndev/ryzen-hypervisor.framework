@@ -14,6 +14,7 @@
 #include "HvPatch.hpp"
 #include "HvMsrs.hpp"
 #include "HvSlots.hpp"
+#include "VcpuName.hpp"
 #include "RyzenHV.hpp"
 #include "KernelDecls.hpp"
 #include "Vm.hpp"
@@ -73,8 +74,27 @@ const char *const kThreadNames[kTraps] = {
  * Logs the call, with the argument as a number and, when it looks like a user pointer that can be read, up to eight
  * words behind it. copyin() fails cleanly for a value that is not a readable address (a deadline, a mask, a slot).
  */
-void logTrap(unsigned type, unsigned index, uint64_t arg, SInt32 n)
+/*
+ * Which calls of a trap are logged, and at what level: the first 24 and #1000, #10000, #100000... at INFO, the other thousandths at
+ * TRACE. Every thousandth at INFO was ~100 lines a second with Docker running: it wrapped the 64 KiB ring in seconds (the start-up
+ * lines, the TSC check and errors were gone) and, mirrored to IOLog, put the same load on the kernel log. 0: do not log.
+ */
+uint32_t trapLogLevel(SInt32 n)
 {
+    if (n <= 24)
+        return RHV_LOG_INFO;
+    if (n % 1000)
+        return 0;
+    SInt32 d = n;
+    while (d % 10 == 0)
+        d /= 10;
+    return d == 1 ? RHV_LOG_INFO : RHV_LOG_TRACE;
+}
+
+void logTrap(unsigned type, unsigned index, uint64_t arg, SInt32 n, uint32_t lvl)
+{
+    if (lvl > rhv::log::level())
+        return;                                   /* skip the copyin as well */
     const char *name = (type == HV_TASK_TRAP ? kTaskNames : kThreadNames)[index];
     uint64_t w[8] = {0};
     unsigned words = 0;
@@ -85,16 +105,16 @@ void logTrap(unsigned type, unsigned index, uint64_t arg, SInt32 n)
                 words = sizes[i] / 8;
     }
     if (words >= 5)
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx %#llx %#llx %#llx%s]", type == HV_TASK_TRAP ? "task" : "thread", index,
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx %#llx %#llx %#llx%s]", type == HV_TASK_TRAP ? "task" : "thread", index,
                  name, (int)n, proc_selfpid(), arg, w[0], w[1], w[2], w[3], w[4], words > 5 ? " ..." : "");
     else if (words >= 2)
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx [%#llx %#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
                  proc_selfpid(), arg, w[0], w[1]);
     else if (words == 1)
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx [%#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx [%#llx]", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n,
                  proc_selfpid(), arg, w[0]);
     else
-        RHV_INFO("trap %s %u %s #%d pid %d arg=%#llx", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n, proc_selfpid(),
+        rhv::log::write(lvl, "trap %s %u %s #%d pid %d arg=%#llx", type == HV_TASK_TRAP ? "task" : "thread", index, name, (int)n, proc_selfpid(),
                  arg);
 }
 
@@ -155,7 +175,7 @@ struct HvVcpu {
     RHVFpuState fpu;
     uint8_t *msrPage;          /* this vCPU's 4 KiB page in the ro area: the managed MSR list, entries of 16 bytes {msr, value} */
     uint32_t nManaged;
-    bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (HyperKit only) */
+    bool     cpuidPending;     /* the last exit was a CPUID: its answer is cleaned on the way back in (cpuidCommonFixup; more for HyperKit, Parallels) */
     uint32_t cpuidLeaf;
     uint32_t cpuidSub;
     uint64_t cr2Page;          /* the CR2 word of the page as this driver last left it: a different value is the client's write (an injected #PF needs it) and is applied */
@@ -165,6 +185,7 @@ struct HvVcpu {
     uint8_t  managedIdx[256];  /* position in the list -> MSR cache index, 0 = a hole */
     uint64_t applied[144];     /* the last value handed to the core for each MSR cache index */
     uint8_t  appliedKnown[144];
+    uint64_t tRunEx0, tRunEx1;   /* profiling: when runEx started and returned in this trap (0: no run) */
 };
 struct HvVm {
     IOLock *lock;
@@ -354,8 +375,8 @@ volatile SInt32 gTraceCount[2][16];
 void note(unsigned type, unsigned index, uint64_t arg)
 {
     SInt32 n = OSIncrementAtomic((volatile SInt32 *)&gTraceCount[type][index]) + 1;
-    if (n <= 24 || (n % 1000) == 0)
-        logTrap(type, index, arg, n);
+    if (uint32_t lvl = trapLogLevel(n))
+        logTrap(type, index, arg, n, lvl);
 }
 
 kern_return_t hvFromIo(IOReturn r);
@@ -422,6 +443,14 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     if (hv_get_thread_target())
         return kHvBusy;                              /* this thread owns a vCPU already */
 
+    /* HyperKit insists on getting the index its thread is named after (VcpuName.hpp); the name lies just below &id. */
+    int wantId = -1;
+    if (vm->hyperkit && a.idPtr >= rhv::hv::kVcpuNameWindow) {
+        uint8_t below[rhv::hv::kVcpuNameWindow];
+        if (copyin((user_addr_t)(a.idPtr - rhv::hv::kVcpuNameWindow), below, sizeof(below)) == 0)
+            wantId = rhv::hv::findVcpuName(below, sizeof(below), kMaxVcpus);
+    }
+
     if (!gSvc)
         return kHvNoDev;
     HvVcpu *v = (HvVcpu *)IOMallocZero(sizeof(HvVcpu));
@@ -441,8 +470,12 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     }
     IOLockLock(vm->lock);
     unsigned id = 0;
-    while (id < kMaxVcpus && vm->vcpu[id])
-        id++;
+    const bool named = wantId >= 0 && !vm->vcpu[wantId];
+    if (named)
+        id = (unsigned)wantId;
+    else
+        while (id < kMaxVcpus && vm->vcpu[id])
+            id++;
     if (id == kMaxVcpus) {
         IOLockUnlock(vm->lock);
         v->cpu->release();
@@ -463,6 +496,12 @@ kern_return_t tVcpuCreate(void *target, uint64_t arg)
     vm->vcpu[id] = v;
     vm->nVcpus++;
     IOLockUnlock(vm->lock);
+    if (vm->hyperkit && !named) {                    /* HyperKit will abort with "vcpu id mismatch" unless the id happens to fit */
+        static volatile SInt32 unnamedLogged;
+        if (OSIncrementAtomic(&unnamedLogged) < 20)
+            RHV_WARN("hv front end: HyperKit vCPU thread %s, gave id %u (pid %d)",
+                     wantId < 0 ? "has no \"vcpu:<n>\" name below its id" : "wants a slot that is taken", id, proc_selfpid());
+    }
 
     uint32_t outId = id;
     if (copyout(&outId, (user_addr_t)a.idPtr, sizeof(outId))) {
@@ -524,11 +563,8 @@ constexpr unsigned R_XCR0 = 50, R_DR0 = 41, R_DR4 = 45, R_DR5 = 46, R_DR6 = 47; 
 /* The core's FP state and XCR0 into the page: the ro FP array (what hv_vcpu_read_fpstate reads) and the XCR0 register. */
 void fpuToPage(HvVcpu *v)
 {
-    v->cpu->getFpu(&v->fpu);
     uint8_t *dst = v->vm->kva[1] + kRoFpOff + v->id * v->vm->fpStride;
-    uint32_t n = v->fpu.size < v->vm->fpStride ? v->fpu.size : v->vm->fpStride;
-    bcopy(v->fpu.area, dst, n);
-    *gprWord(v, R_XCR0) = v->fpu.xcr0;
+    *gprWord(v, R_XCR0) = v->cpu->copyGuestFpu(dst, v->vm->fpStride);
 }
 
 /* Thread trap 7: the client read a slot that is not valid in its cache: ask the SVM core for the field and put it there. */
@@ -614,7 +650,11 @@ kern_return_t tCapWrite(void *target, uint64_t slot)
 kern_return_t tInvalidateTlb(void *target, uint64_t arg)
 {
     note(HV_THREAD_TRAP, 2, arg);
-    return target ? kHvOk : kHvNoDev;
+    HvVcpu *v = static_cast<HvVcpu *>(target);
+    if (!v)
+        return kHvNoDev;
+    v->cpu->requestTlbFlush();          /* the vCPU keeps its ASID across exits now: the next VMRUN flushes it */
+    return kHvOk;
 }
 
 /* Managed MSRs (thread traps 3 enable, 4 disable, 10 set access): the guest uses the MSR natively; the client reads its value from the
@@ -795,6 +835,23 @@ void parallelsCpuidFixup(HvVcpu *v)
     }
 }
 
+/*
+ * Every client, after its own CPUID answer and the client-specific clean-up above: no protection keys. The clients build CPUID from the host:
+ * leaf 7 shows PKU (Zen 5 has it), while leaf 0xD is cut down to the host thread's XCR0, which macOS keeps at x87/SSE/AVX (0x7): no PKRU
+ * state component. A guest then sets CR4.PKE but has no XSAVE slot for PKRU. Linux 6.12 (Android 37's kernel) then cannot build a signal
+ * frame: get_xsave_addr_user(PKRU) warns and returns NULL, put_user(pkru, NULL) faults into its fixup, the signal cannot be delivered and
+ * is retried forever (the emulator's black screen: init loops in the exception-table search). This kernel could not give the guest PKRU
+ * anyway: the guest's XCR0 may only hold state the host thread has enabled (Vm::run refuses anything else), and PKRU is not switched
+ * between guest and host. So hide PKU and OSPKE, and PKRU in leaf 0xD in case a client passes it.
+ */
+void cpuidCommonFixup(HvVcpu *v)
+{
+    if (v->cpuidLeaf == 7 && v->cpuidSub == 0)
+        *gprWord(v, R_RCX) &= ~((1ull << 3) | (1ull << 4));   /* PKU, OSPKE */
+    else if (v->cpuidLeaf == 0xD && v->cpuidSub == 0)
+        *gprWord(v, R_RAX) &= ~(1ull << 9);                  /* XCR0 bit 9, PKRU */
+}
+
 /* What the client changes before a run: segment registers and their bases/rights, RIP/RSP/RFLAGS and the MSRs that carry the GS state. Called only with the recording on. */
 inline void dbgNoteWrite(unsigned vcpu, uint64_t id, uint64_t val)
 {
@@ -920,26 +977,57 @@ void dbgRecord(HvVcpu *v)
     }
 }
 
+static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg);
+
 kern_return_t tVcpuRun(void *target, uint64_t arg)
 {
-    note(HV_THREAD_TRAP, 0, arg);
     HvVcpu *v = static_cast<HvVcpu *>(target);
     if (!v)
         return kHvNoDev;
+    const uint64_t t0 = __builtin_ia32_rdtsc();
+    v->tRunEx0 = v->tRunEx1 = 0;
+    const kern_return_t kr = vcpuRunBody(v, arg);
+    const uint64_t t1 = __builtin_ia32_rdtsc();
+    if (v->tRunEx1)                                   /* the run happened: split the trap up */
+        v->cpu->profTrap(t1 - t0, v->tRunEx0 - t0, v->tRunEx1 - v->tRunEx0);
+    return kr;
+}
+
+static kern_return_t vcpuRunBody(HvVcpu *v, uint64_t arg)
+{
+    note(HV_THREAD_TRAP, 0, arg);
     com_overlorddev_RyzenHVVm *cpu = v->cpu;
 
     /* 1. What the client changed since the last run: registers from the page, VMCS fields from the dirty slots. */
     /* HyperKit answers CPUID from the host's values, which on a Ryzen are AMD's; a Linux guest then trusts features HyperKit does not emulate
      * (MWAITX in its delay loop, SVM, extended topology, AMD counters, IBPB/IBRS/SSBD enumeration). Clean the answer it just wrote. */
     if (v->cpuidPending && v->vm->parallels) {
-        v->cpuidPending = false;
         parallelsCpuidFixup(v);
-    } else if (v->cpuidPending) {
-        v->cpuidPending = false;
+    } else if (v->cpuidPending && v->vm->hyperkit) {
         if (v->cpuidLeaf == 0x80000001u)
             *gprWord(v, R_RCX) &= ~((1ull << 2) | (1ull << 22) | (1ull << 23) | (1ull << 24) | (1ull << 26) | (1ull << 27) | (1ull << 29));
         else if (v->cpuidLeaf == 0x80000008u)
             *gprWord(v, R_RBX) = 0;
+        else if (v->cpuidLeaf == 0x80000021u)
+            /* EAX bit 22, workload classification (Zen 5): Linux then writes MSR_AMD_WORKLOAD_HRST (0xC0000502) on context switches.
+             * HyperKit does not know the MSR: every write went out to userland and printed "wrmsr to register 0xc0000502(0x1)",
+             * ~4000 lines a second, and com.docker.backend burnt a core parsing them. */
+            *gprWord(v, R_RAX) &= ~(1ull << 22);
+        else if (v->cpuidLeaf == 0x80000026u) {
+            /* AMD extended topology (Zen 4 and later). HyperKit (src/lib/vmm/x86.c, x86_emulate_cpuid) caps leaves at the host's
+             * 0x80000000 maximum and passes unknown ones through with cpuid_count, so EDX carried the x2APIC id of whichever host
+             * core the vCPU thread ran on. Linux reads this leaf before 0xB on AMD (arch/x86/kernel/cpu/topology_ext.c,
+             * cpu_parse_topology_ext), so the guest saw "APIC ID mismatch. CPUID: 0x0017 APIC: 0x0001" and a broken topology.
+             * All zeros is an invalid level (num_processors 0): Linux falls back to leaf 0xB, which HyperKit fills with vcpu_id. */
+            *gprWord(v, R_RAX) = 0;
+            *gprWord(v, R_RBX) = 0;
+            *gprWord(v, R_RCX) = 0;
+            *gprWord(v, R_RDX) = 0;
+        }
+    }
+    if (v->cpuidPending) {
+        v->cpuidPending = false;
+        cpuidCommonFixup(v);
     }
     RHVRegs regs;
     cpu->getRegs(&regs);
@@ -1129,7 +1217,9 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
         }
     }
     const uint64_t inRax = regs.rax, inRcx = regs.rcx, inRdx = regs.rdx;       /* what the client set before this entry */
+    v->tRunEx0 = __builtin_ia32_rdtsc();
     IOReturn rc = cpu->runEx(&v->in, &v->out);
+    v->tRunEx1 = __builtin_ia32_rdtsc();
     if (rc != kIOReturnSuccess) {
         static volatile SInt32 failed;
         if (!v->vm->hyperkit && OSIncrementAtomic(&failed) < 30)
@@ -1163,7 +1253,7 @@ kern_return_t tVcpuRun(void *target, uint64_t arg)
                      (unsigned long long)inRdx, (unsigned long long)intr, (unsigned long long)cr0);
         }
     }
-    if (v->vm->hyperkit || v->vm->parallels) {
+    {                                                   /* every client: its CPUID answer is cleaned on the way back in */
         uint64_t exitReason = 0;
         for (unsigned i = 0; i < RHV_RUN_NFIELDS; i++)
             if (kRunFields[i] == 0x4402)
@@ -1348,8 +1438,8 @@ kern_return_t stub(void *target, uint64_t arg)
 {
     (void)target;
     SInt32 n = OSIncrementAtomic((volatile SInt32 *)&gCount[Type][Index]) + 1;
-    if (n <= 24 || (n % 1000) == 0)
-        logTrap(Type, Index, arg, n);
+    if (uint32_t lvl = trapLogLevel(n))
+        logTrap(Type, Index, arg, n, lvl);
     return gMode >= 2 ? KERN_SUCCESS : kHvUnsupported;
 }
 

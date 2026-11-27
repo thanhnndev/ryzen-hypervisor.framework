@@ -36,6 +36,7 @@ enum : uint32_t {
     F_CPU_BASED2         = 0x401e,
     F_CR0_MASK           = 0x6000,
     F_CR4_MASK           = 0x6002,
+    F_GUEST_SS_AR        = 0x4818,
     F_GUEST_CR0          = 0x6800,
     F_GUEST_CR4          = 0x6804,
     F_RO_INSTR_ERROR     = 0x4400,
@@ -141,12 +142,41 @@ public:
     uint64_t dr(unsigned i) const { return fDr[i & 3]; }
     void     setDr(unsigned i, uint64_t v) { fDr[i & 3] = v; }
 
+    /*
+     * A field's place, worked out once. read() costs a binary search over the field table plus mapField's scans; the front
+     * end reads the same 55 fields after every VM exit, so it keeps a plan for each (RunPlan in Vm.cpp) and calls readPlanned.
+     */
+    struct ReadPlan {
+        uint32_t enc;
+        int      idx;          /* fieldIndex(enc), -1 for an extension field */
+        StateMap map;
+        bool     valid;
+    };
+    static ReadPlan plan(uint32_t enc)
+    {
+        ReadPlan p;
+        p.enc   = enc;
+        p.idx   = fieldIndex(enc);
+        p.valid = p.idx >= 0 || isExtField(enc);
+        p.map   = p.valid ? mapField(enc) : StateMap{};
+        return p;
+    }
+    Result readPlanned(const ReadPlan &p, uint64_t *out) const
+    {
+        return p.valid ? readMapped(p.enc, p.idx, p.map, out) : R_INVALID_FIELD;
+    }
+
     Result read(uint32_t enc, uint64_t *out) const
     {
         int idx = fieldIndex(enc);
         if (idx < 0 && !isExtField(enc))
             return R_INVALID_FIELD;
-        StateMap m = mapField(enc);
+        return readMapped(enc, idx, mapField(enc), out);
+    }
+
+private:
+    Result readMapped(uint32_t enc, int idx, const StateMap &m, uint64_t *out) const
+    {
         switch (m.kind) {
         case KIND_EXT_DR:
             *out = fDr[m.vmcbOff];
@@ -160,9 +190,16 @@ public:
             *out = v & mask(fieldBytes(enc));
             return R_OK;
         }
-        case KIND_SEG_AR:
-            *out = arFromAttrib((uint16_t)loadBytes(m.vmcbOff, 2));
+        case KIND_SEG_AR: {
+            uint32_t ar = arFromAttrib((uint16_t)loadBytes(m.vmcbOff, 2));
+            /* VMX: CPL is SS.DPL. SVM keeps CPL in its own VMCB field, and the SS attributes it saves do not always follow
+             * (SYSRET to user mode leaves SS.DPL 0: a user-mode vCPU read back as SS.DPL 0, i.e. kernel). Report the CPL, as
+             * KVM's svm_get_segment does. */
+            if (enc == F_GUEST_SS_AR)
+                ar = (ar & ~0x60u) | ((uint32_t)(fVmcb->save.cpl & 3) << 5);
+            *out = ar;
             return R_OK;
+        }
         case KIND_EFER:
             *out = loadBytes(m.vmcbOff, 8) & ~rhv::vmcb::EFER_SVME;     /* SVME is ours, the guest never sees it */
             return R_OK;
@@ -182,6 +219,7 @@ public:
         }
     }
 
+public:
     Result write(uint32_t enc, uint64_t value)
     {
         int idx = fieldIndex(enc);
@@ -206,6 +244,11 @@ public:
             return R_OK;
         case KIND_SEG_AR:
             storeBytes(m.vmcbOff, 2, attribFromAr((uint32_t)value));
+            /* The CPL follows SS.DPL (VMX), as in KVM's svm_set_segment. Without this a client that loads a whole vCPU state
+             * (a snapshot restore taken in user mode) left the VMCB at CPL 0: the guest's first interrupt then ran its kernel
+             * on the user stack with the user GS. */
+            if (enc == F_GUEST_SS_AR)
+                fVmcb->save.cpl = (uint8_t)((value >> 5) & 3);
             return R_OK;
         case KIND_EFER:
             storeBytes(m.vmcbOff, 8, value | rhv::vmcb::EFER_SVME);
@@ -444,5 +487,8 @@ private:
 
 } // namespace vmx
 } // namespace rhv
+
+#include "AbiStamp.hpp"
+RHV_ABI_STAMP_AS(VmcsState, rhv::vmx::VmcsState)
 
 #endif /* RYZENHV_VMCSSTATE_HPP */
