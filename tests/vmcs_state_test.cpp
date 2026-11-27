@@ -83,6 +83,10 @@ void testStateFields()
     CHECK(f.st.write(0x4818, 0xC093) == R_OK && f.vmcb.save.cpl == 0);
     CHECK((rd(f, 0x4818) & 0x60) == 0);
     CHECK(f.st.write(0x4818, 0x10000 | 0x60) == R_OK && f.vmcb.save.cpl == 3);    /* unusable SS still carries the DPL */
+    CHECK(f.st.write(0x4816, 0xA0FB) == R_OK && f.vmcb.save.cpl == 3);            /* CS AR (DPL 3) leaves the CPL alone */
+    f.vmcb.save.cpl = 0;
+    CHECK(f.st.write(0x4816, 0xA0FB) == R_OK && f.vmcb.save.cpl == 0);
+    f.vmcb.save.cpl = 3;
     CHECK(f.st.write(0x4818, 0xC093) == R_OK && f.vmcb.save.cpl == 0);
     CHECK(f.st.write(0x4804, 0x1FFFFFFFFull) == R_OK && f.vmcb.save.ss.limit == 0xFFFFFFFF);
     /* SYSENTER_CS is 32 bits in the VMCS but a 64-bit slot in the VMCB. */

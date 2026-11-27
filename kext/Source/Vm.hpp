@@ -207,6 +207,7 @@ public:
     /* VMX mode (RHV_VMCREATE_VMX): the Hypervisor.framework view of the guest. */
     bool     isVmx() const { return fVmx; }
     IOReturn vmcsRead(uint32_t field, uint64_t *value);
+    uint16_t debugSsAttrib();                                     /* the raw VMCB SS attributes (AMD: SS.DPL need not equal the CPL) */
     uint8_t  debugCpl();                                          /* the CPL the VMCB holds (debugging, rhv-info hv flightdump) */
     IOReturn vmcsWrite(uint32_t field, uint64_t value);
 
@@ -257,6 +258,7 @@ private:
     bool                      fHasTscAux;        /* the CPU has RDTSCP, so IA32_TSC_AUX */
     uint32_t                  fFpuSize;
     volatile uint32_t         fKick;
+    volatile SInt32           fCplChangeLogs;    /* SS AR writes that changed the CPL in protected mode, logged up to 8 (vmcsWrite) */
     volatile int              fRunCpu;           /* CPU inside VMRUN, -1 when none; for kick() */
     bool                      fVmx;
     rhv::GuestGprs            fGprs;

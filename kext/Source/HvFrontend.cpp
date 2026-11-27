@@ -219,6 +219,7 @@ struct Flight {
     uint32_t csSel;
     uint64_t cr2, gsBase, r9, kernGsBase;
     uint32_t csAr, ssSel, ssAr;
+    uint16_t ssRaw;                               /* VMCB SS attributes as stored (ssAr reports the CPL as DPL) */
     uint8_t cpl;
     uint8_t nw;                                   /* what the client wrote before this run (see dbgNoteWrite) */
     uint64_t wid[6], wval[6];
@@ -902,6 +903,7 @@ void dbgRecord(HvVcpu *v)
     }
     f.r9 = v->out.regs.r9;
     f.cpl = v->cpu->debugCpl();
+    f.ssRaw = v->cpu->debugSsAttrib();
     if (v->id < 64) {
         PendWrites &pw = gPend[v->id];
         f.nw = pw.n;
@@ -1652,15 +1654,15 @@ void flightDump(uint32_t arg)
         count = kFlightN;
     if (count > total)
         count = total;
-    RHV_INFO("flight: %u exits ending %u before the newest of %u recorded, oldest first (seq reason qual rip rsp rflags rax r9 cr2 gs kgs cs sel/ar ss sel/ar cpl)", count, skip, recorded);
+    RHV_INFO("flight: %u exits ending %u before the newest of %u recorded, oldest first (seq reason qual rip rsp rflags rax r9 cr2 gs kgs cs sel/ar ss sel/ar/raw VMCB attrib; c = VMCB cpl)", count, skip, recorded);
     for (uint32_t i = total - count; i < total; i++) {
         const Flight f = gFlight[i & (kFlightN - 1)];
         if (f.seq != i + 1)
             continue;                                /* overwritten while reading */
-        RHV_INFO("f%u r%u c%u q%llx ip %llx sp %llx fl %llx ax %llx r9 %llx cr2 %llx gs %llx kg %llx cs %x/%x ss %x/%x", (unsigned)f.seq, f.reason, f.cpl,
+        RHV_INFO("f%u r%u c%u q%llx ip %llx sp %llx fl %llx ax %llx r9 %llx cr2 %llx gs %llx kg %llx cs %x/%x ss %x/%x/%x", (unsigned)f.seq, f.reason, f.cpl,
                  (unsigned long long)f.qual, (unsigned long long)f.rip, (unsigned long long)f.rsp, (unsigned long long)f.rflags,
                  (unsigned long long)f.rax, (unsigned long long)f.r9, (unsigned long long)f.cr2, (unsigned long long)f.gsBase,
-                 (unsigned long long)f.kernGsBase, f.csSel, f.csAr, f.ssSel, f.ssAr);
+                 (unsigned long long)f.kernGsBase, f.csSel, f.csAr, f.ssSel, f.ssAr, (unsigned)f.ssRaw);
         if (f.nw) {
             char w[200];
             int n = 0;

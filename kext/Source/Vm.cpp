@@ -2462,6 +2462,11 @@ IOReturn com_overlorddev_RyzenHVVm::setFpu(const RHVFpuState *in)
     return kIOReturnSuccess;
 }
 
+uint16_t com_overlorddev_RyzenHVVm::debugSsAttrib()
+{
+    return ((const Vmcb *)fVmcb.va)->save.ss.attrib;
+}
+
 uint8_t com_overlorddev_RyzenHVVm::debugCpl()
 {
     return ((const Vmcb *)fVmcb.va)->save.cpl;
@@ -2535,10 +2540,22 @@ IOReturn com_overlorddev_RyzenHVVm::vmcsWrite(uint32_t field, uint64_t value)
     if (field >= rhv::vmx::X_DR0 && field <= rhv::vmx::X_DR3 && (uint64_t)(((int64_t)(value << 16)) >> 16) != value)
         return kIOReturnBadArgument;
     IOLockLock(fLock);
+    const Vmcb *vb = (const Vmcb *)fVmcb.va;
+    const uint8_t cplBefore = vb->save.cpl;
     rhv::vmx::Result r = fVmcs.write(field, value);
     if (r == rhv::vmx::R_OK && field == rhv::vmx::F_GUEST_RIP)
         fHaveNextRip = false;           /* the client moved RIP itself */
+    const uint8_t cplAfter = vb->save.cpl;
+    const bool pe = (vb->save.cr0 & 1) != 0;
     IOLockUnlock(fLock);
+    /* An SS AR write that changes the CPL in protected mode is a state load (snapshot restore, migration) or a client that
+     * writes SS on its own: legitimate, but rare, so log the first few per VM to catch a client that misbehaves. */
+    if (r == rhv::vmx::R_OK && field == rhv::vmx::F_GUEST_SS_AR && cplBefore != cplAfter && pe) {
+        const SInt32 n = OSIncrementAtomic(&fCplChangeLogs);
+        if (n < 8)
+            RHV_INFO("SS AR write 0x%llx changed the CPL %u -> %u (CR0.PE 1)%s", (unsigned long long)value,
+                     (unsigned)cplBefore, (unsigned)cplAfter, n == 7 ? "; further changes not logged" : "");
+    }
     switch (r) {
     case rhv::vmx::R_OK:         return kIOReturnSuccess;
     case rhv::vmx::R_READ_ONLY:  return kIOReturnNotWritable;
