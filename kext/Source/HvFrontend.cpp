@@ -161,6 +161,16 @@ volatile int *gSupportPtr = nullptr;                 /* the kernel's hv_support_
 int gSupportSaved = 0;
 bool gSupportSet = false;
 
+/* VZ probe (stage 0 of the in-kernel APIC plan, `rhv-info hv vzprobe 1|0`). While on:
+ *   - hv_vm_create with flag 0x400 (the in-kernel APIC variant that Virtualization.framework uses) is accepted, as a plain VM: the in-kernel
+ *     APIC is NOT emulated, so the guest gets no interrupts and will not boot. The point is the trace of what the client calls next.
+ *   - the stub traps answer success (as mode 2 does) and log their first kVzProbeLogCalls calls at INFO, with their argument words.
+ *   - kern.hv_support shows 1 (taken here unless it already was, and given back when the probe goes off).
+ * Off by default and not settable by boot-arg; HyperKit's VMs never take these paths (no 0x400, no stub traps). */
+volatile int gVzProbe = 0;
+bool gVzProbeSysctl = false;                          /* the probe took kern.hv_support, so it gives it back */
+constexpr SInt32 kVzProbeLogCalls = 400;
+
 com_overlorddev_RyzenHV *gSvc = nullptr;     /* for the CPU info a vCPU object needs; set by start(), lives as long as the kext */
 
 struct HvVm;
@@ -198,6 +208,7 @@ struct HvVm {
     uint64_t tscOffset;                        /* from hv_vm_sync_tsc, handed to vCPUs created later */
     bool     tscValid;
     bool     hyperkit;                         /* the creating process is Docker's HyperKit: its CPUID answers get the AMD-only features removed */
+    bool     vzProbe;                          /* created with flag 0x400 while the VZ probe was on: a plain VM, no in-kernel APIC */
     bool     parallels;                        /* the creating process is Parallels' VM process: its LAPIC page (GPA 0xFEE00000) is not mapped */
     uint64_t caps[17];                         /* the VMX capability words this VM's client was shown (HV_VMX_CAP_*), also what thread trap 12 answers from */
     HvVcpu *vcpu[kMaxVcpus];
@@ -391,12 +402,20 @@ kern_return_t tVmCreate(void *target, uint64_t arg)
     struct { uint64_t flags, info; } a = {0, 0};
     if (copyin((user_addr_t)arg, &a, sizeof(a)))
         return kHvError;
-    if (a.flags & 0x400)
-        return kHvUnsupportedCode;                   /* the in-kernel APIC variant */
+    const bool apicFlag = (a.flags & 0x400) != 0;     /* the in-kernel APIC variant */
+    if (gVzProbe) {
+        char pname[64] = {0};
+        proc_selfname(pname, sizeof(pname));
+        RHV_INFO("hv front end: VZ probe: vm_create flags %#llx from %s (pid %d): %s", (unsigned long long)a.flags, pname, proc_selfpid(),
+                 apicFlag ? "accepted as a plain VM, the in-kernel APIC is not emulated" : "no in-kernel APIC asked");
+    }
+    if (apicFlag && !gVzProbe)
+        return kHvUnsupportedCode;
     uint64_t info[kInfoBytes / 8];
     HvVm *vm = vmCreate(info);
     if (!vm)
         return kHvNoRes;
+    vm->vzProbe = apicFlag;
     if (copyout(info, (user_addr_t)a.info, kInfoBytes)) {
         vmFree(vm);
         return kHvError;
@@ -1440,9 +1459,10 @@ kern_return_t stub(void *target, uint64_t arg)
 {
     (void)target;
     SInt32 n = OSIncrementAtomic((volatile SInt32 *)&gCount[Type][Index]) + 1;
-    if (uint32_t lvl = trapLogLevel(n))
+    const bool probe = gVzProbe != 0;
+    if (uint32_t lvl = probe && n <= kVzProbeLogCalls ? (uint32_t)RHV_LOG_INFO : trapLogLevel(n))
         logTrap(Type, Index, arg, n, lvl);
-    return gMode >= 2 ? KERN_SUCCESS : kHvUnsupported;
+    return gMode >= 2 || probe ? KERN_SUCCESS : kHvUnsupported;
 }
 
 #define S(T, I) stub<T, I>
@@ -1471,6 +1491,35 @@ bool setTprShadow(bool on)
 
 bool tprShadow() { return gTprShadow != 0; }
 bool sysctlTaken() { return gSupportSet; }
+bool vzProbe() { return gVzProbe != 0; }
+
+bool setVzProbe(bool on)
+{
+    if (!on) {
+        if (!gVzProbe)
+            return true;
+        gVzProbe = 0;
+        if (gVzProbeSysctl) {
+            setSysctl(false);
+            gVzProbeSysctl = false;
+        }
+        RHV_SYNC("hv front end: VZ probe off (vm_create flag 0x400 refused again, stubs answer per mode %u)", gMode);
+        return true;
+    }
+    if (gVzProbe)
+        return true;
+    if (!gRegistered && !setMode(1))
+        return false;
+    if (!gSupportSet) {
+        if (!setSysctl(true))
+            return false;
+        gVzProbeSysctl = true;
+    }
+    gVzProbe = 1;
+    RHV_SYNC("hv front end: VZ probe ON: vm_create flag 0x400 accepted as a plain VM (no in-kernel APIC, the guest will not boot), stub traps answer "
+             "success and log their first %d calls, kern.hv_support is 1", (int)kVzProbeLogCalls);
+    return true;
+}
 
 static bool registerTraps()
 {

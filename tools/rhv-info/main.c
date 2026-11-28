@@ -307,6 +307,19 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
     } else if (argc > 3 && !strcmp(argv[2], "readguest")) {
         in[0] = kRHVHvReadGuest;
         in[1] = strtoull(argv[3], NULL, 16);
+    } else if (argc > 2 && !strcmp(argv[2], "vzprobe")) {
+        /* vzprobe [0|1]: stage 0 of the in-kernel APIC plan. 1 accepts hv_vm_create flag 0x400 as a plain VM (the guest will not boot),
+         * stub traps answer success and log their first 400 calls, kern.hv_support shows 1; 0 undoes it. No value: read. Needs root to change. */
+        uint64_t vin[2] = { kRHVHvVzProbe, argc > 3 ? strtoull(argv[3], NULL, 0) : kRHVHvGetValue }, vout[2] = { 0, 0 };
+        uint32_t vn = 2;
+        kern_return_t vkr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, vin, 2, vout, &vn);
+        if (vkr != KERN_SUCCESS) {
+            fprintf(stderr, "hv vzprobe: 0x%x (value must be 0 or 1; changing it needs root; a kext before 0.7.28 does not know it)\n", vkr);
+            return 1;
+        }
+        printf("VZ probe: %s; front end %s, kern.hv_support %s\n", vout[1] ? "ON" : "off",
+               (vout[0] & kRHVHvStateRegistered) ? "registered" : "not registered", (vout[0] & kRHVHvStateSysctl) ? "1 (ours)" : "untouched");
+        return 0;
     } else if (argc > 2 && !strcmp(argv[2], "cache")) {
         /* cache [N]: VMRUN shortcuts, bit 0 VMCB clean bits, bit 1 keep ASIDs across exits (3 = 0.7.22 default, 0 = as 0.7.21) */
         uint64_t cin[2] = { kRHVHvCache, argc > 3 ? strtoull(argv[3], NULL, 0) : kRHVHvGetValue }, cout[2] = { 0, 0 };
@@ -370,7 +383,7 @@ static int cmd_hv(io_connect_t conn, int argc, char **argv)
         }
         return 0;
     } else if (argc > 2 && strcmp(argv[2], "status")) {
-        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA | reclaim [0|1 | period MS | cold N | batch MIB] | cache [0..3] | exctrace [MASK] | excdump [N]]\n");
+        fprintf(stderr, "usage: rhv-info hv [status | mode 0|1|2 | sysctl 0|1 | tpr 0|1 | svmlimit N | rescan | debug N | flightdump [N [SKIP]] | readguest HEXVA | reclaim [0|1 | period MS | cold N | batch MIB] | cache [0..3] | exctrace [MASK] | excdump [N] | vzprobe [0|1]]\n");
         return 2;
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kRHVMethodHvControl, in, 2, out, &(uint32_t){ 2 });

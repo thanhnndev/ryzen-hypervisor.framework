@@ -30,6 +30,9 @@ bool tprShadow();
 uint32_t mode();
 bool registered();
 bool sysctlTaken();
+/* VZ probe (stage 0 of the in-kernel APIC plan): accept vm_create flag 0x400 as a plain VM and log what the client calls next. Off by default. */
+bool setVzProbe(bool on);
+bool vzProbe();
 
 /* Debugging of a stalled client (rhv-info hv debug / flightdump / readguest). Everything goes to the kernel log. Off by default. */
 void debugSet(uint32_t flags);

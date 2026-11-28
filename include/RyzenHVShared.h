@@ -166,11 +166,17 @@ enum {
      * traceable for that reason).
      */
     kRHVHvExcTrace      = 14,
-    kRHVHvExcDump       = 15  /* debugging, value N: writes the newest N traced exceptions and the per-vector counts to the kernel log */
+    kRHVHvExcDump       = 15, /* debugging, value N: writes the newest N traced exceptions and the per-vector counts to the kernel log */
+    /*
+     * Since 0.7.28, debugging: the VZ probe (stage 0 of the in-kernel APIC plan). value 1: hv_vm_create with flag 0x400 is accepted as a
+     * plain VM (no in-kernel APIC: the guest will not boot), stub traps answer success and log their first 400 calls, kern.hv_support shows 1.
+     * value 0: all of that is undone. kRHVHvGetValue only reads. state[0] = the usual state bits, state[1] = 1 while the probe is on.
+     */
+    kRHVHvVzProbe       = 16
 };
 #define kRHVHvGetValue (~0ull)
 /* state bits returned in scalarOutput[0] */
-enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1, kRHVHvStateTpr = 1u << 2 };
+enum { kRHVHvStateRegistered = 1u << 0, kRHVHvStateSysctl = 1u << 1, kRHVHvStateTpr = 1u << 2, kRHVHvStateVzProbe = 1u << 3 };
 
 #define RHV_GUEST_RAM_SIZE (1u << 20)   /* built-in RAM: 1 MiB at guest physical 0 */
 

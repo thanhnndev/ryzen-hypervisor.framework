@@ -286,6 +286,20 @@ IOReturn com_overlorddev_RyzenHVUserClient::sHvControl(OSObject *target, void *,
         args->scalarOutput[1] = 0;
         return kIOReturnSuccess;
     }
+    if (cmd == kRHVHvVzProbe) {                                   /* stage 0 of the in-kernel APIC plan, HvFrontend.cpp */
+        const uint64_t v64 = args->scalarInput[1];
+        if (v64 != kRHVHvGetValue) {
+            RHV_ADMIN();
+            if (v64 > 1)
+                return kIOReturnBadArgument;
+            if (!rhv::hv::setVzProbe(v64 != 0))
+                return kIOReturnNotReady;
+        }
+        args->scalarOutput[0] = (rhv::hv::registered() ? kRHVHvStateRegistered : 0) | (rhv::hv::sysctlTaken() ? kRHVHvStateSysctl : 0) |
+                                (rhv::hv::tprShadow() ? kRHVHvStateTpr : 0) | (rhv::hv::vzProbe() ? kRHVHvStateVzProbe : 0);
+        args->scalarOutput[1] = rhv::hv::vzProbe() ? 1 : 0;
+        return kIOReturnSuccess;
+    }
     if (cmd == kRHVHvCache) {                                     /* VMRUN shortcuts (clean bits, kept ASIDs), Vm.cpp */
         const uint64_t v64 = args->scalarInput[1];
         if (v64 != kRHVHvGetValue) {
